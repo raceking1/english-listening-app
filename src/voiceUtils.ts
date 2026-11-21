@@ -25,6 +25,45 @@ const MALE_INDICATORS = [
   'en-us-x-iom', 'en-us-x-iol', 'en-us-x-tpd', 'en-gb-x-rjs', 'en-au-x-afh'
 ];
 
+export function formatVoiceLang(lang: string): string {
+  return (lang || 'en-US').replace(/_/g, '-');
+}
+
+export function isEnglishVoice(voice: SpeechSynthesisVoice): boolean {
+  return /^en([-_]|$)/i.test((voice.lang || '').trim());
+}
+
+/**
+ * Filter strictly English voices (en-US, en-GB, en-AU, etc.), deduplicate by voiceURI,
+ * and sort en-US / en-GB first for convenient selection on mobile & PC.
+ */
+export function filterEnglishVoices(allVoices: SpeechSynthesisVoice[]): SpeechSynthesisVoice[] {
+  const seen = new Set<string>();
+  const english = allVoices.filter((v) => {
+    if (!isEnglishVoice(v)) return false;
+    const key = v.voiceURI || `${v.name}-${v.lang}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  const priority = (lang: string) => {
+    const norm = formatVoiceLang(lang).toLowerCase();
+    if (norm === 'en-us') return 0;
+    if (norm === 'en-gb') return 1;
+    if (norm === 'en-au') return 2;
+    if (norm === 'en-ca') return 3;
+    return 4;
+  };
+
+  return english.sort((a, b) => {
+    const pa = priority(a.lang);
+    const pb = priority(b.lang);
+    if (pa !== pb) return pa - pb;
+    return a.name.localeCompare(b.name);
+  });
+}
+
 export function detectVoiceGender(voice: SpeechSynthesisVoice): 'female' | 'male' | 'unknown' {
   const name = voice.name.toLowerCase();
   for (const indicator of MALE_INDICATORS) {
@@ -46,7 +85,7 @@ export function pickBestDefaultVoices(voices: SpeechSynthesisVoice[]): {
   femaleVoice: SpeechSynthesisVoice | null;
   maleVoice: SpeechSynthesisVoice | null;
 } {
-  const englishVoices = voices.filter((v) => v.lang.startsWith('en'));
+  const englishVoices = filterEnglishVoices(voices);
   const candidatePool = englishVoices.length > 0 ? englishVoices : voices;
 
   let female: SpeechSynthesisVoice | null = null;
@@ -82,4 +121,5 @@ export function pickBestDefaultVoices(voices: SpeechSynthesisVoice[]): {
 
   return { femaleVoice: female, maleVoice: male };
 }
+
 

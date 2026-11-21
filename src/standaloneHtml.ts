@@ -514,11 +514,32 @@ export function generateStandaloneHtml(
         <div class="form-group">
           <label for="selectVoiceMode">음성 재생 방식</label>
           <select id="selectVoiceMode">
-            <option value="alternate" selected>남/녀 음성 번갈아 교차 (추천)</option>
-            <option value="female-only">여성 음성만 사용</option>
-            <option value="male-only">남성 음성만 사용</option>
+            <option value="alternate" ${initialVoiceMode === 'alternate' ? 'selected' : ''}>남/녀 음성 번갈아 교차 (추천)</option>
+            <option value="custom" ${initialVoiceMode === 'custom' ? 'selected' : ''}>선택한 영어 음성 고정</option>
+            <option value="female-only" ${initialVoiceMode === 'female-only' ? 'selected' : ''}>여성 음성만 사용</option>
+            <option value="male-only" ${initialVoiceMode === 'male-only' ? 'selected' : ''}>남성 음성만 사용</option>
           </select>
         </div>
+      </div>
+
+      <!-- 영어 음성 선택 드롭다운 -->
+      <div style="margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border-color);">
+        <div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px;">
+          <label for="selectEnglishVoice" style="margin-bottom: 0; display: flex; align-items: center; gap: 6px;">
+            🗣️ 영어 음성 선택
+            <span id="voiceCountBadge" style="font-size: 0.72rem; font-weight: 700; color: var(--primary); background: var(--primary-light); padding: 2px 8px; border-radius: 999px;">0개 로드됨</span>
+          </label>
+          <div style="display: flex; gap: 6px;">
+            <button type="button" id="btnPreviewVoice" class="btn-secondary" style="min-height: 36px; padding: 6px 12px; font-size: 0.78rem;">🔊 미리듣기</button>
+            <button type="button" id="btnRefreshVoices" class="btn-secondary" style="min-height: 36px; padding: 6px 12px; font-size: 0.78rem;">🔄 새로고침</button>
+          </div>
+        </div>
+        <select id="selectEnglishVoice" style="width: 100%; min-height: 44px;">
+          <option value="">기기의 영어 음성 목록을 불러오는 중...</option>
+        </select>
+        <p style="font-size: 0.75rem; color: var(--text-muted); margin-top: 6px;">
+          다른 영어 음성을 선택하면 다음 재생부터 즉시 선택한 목소리로 읽어줍니다.
+        </p>
       </div>
     </section>
 
@@ -645,6 +666,8 @@ export function generateStandaloneHtml(
     let sessionElapsedSeconds = 0;
     let sessionTimerInterval = null;
 
+    let englishVoices = [];
+    let selectedVoiceURI = '';
     let femaleVoice = null;
     let maleVoice = null;
 
@@ -657,6 +680,10 @@ export function generateStandaloneHtml(
     const valPause = document.getElementById('valPause');
     const valRate = document.getElementById('valRate');
     const selectVoiceMode = document.getElementById('selectVoiceMode');
+    const selectEnglishVoice = document.getElementById('selectEnglishVoice');
+    const voiceCountBadge = document.getElementById('voiceCountBadge');
+    const btnPreviewVoice = document.getElementById('btnPreviewVoice');
+    const btnRefreshVoices = document.getElementById('btnRefreshVoices');
 
     const btnStart = document.getElementById('btnStart');
     const btnPause = document.getElementById('btnPause');
@@ -668,8 +695,6 @@ export function generateStandaloneHtml(
     const voiceModeText = document.getElementById('voiceModeText');
     const btnLoopToggle = document.getElementById('btnLoopToggle');
     const loopStatusText = document.getElementById('loopStatusText');
-    const btnBgAudioToggle = document.getElementById('btnBgAudioToggle');
-    const bgAudioText = document.getElementById('bgAudioText');
     const btnOpenHistory = document.getElementById('btnOpenHistory');
     const btnSaveToday = document.getElementById('btnSaveToday');
     const historyCount = document.getElementById('historyCount');
@@ -679,7 +704,6 @@ export function generateStandaloneHtml(
     const btnMobilePrev = document.getElementById('btnMobilePrev');
     const btnMobileNext = document.getElementById('btnMobileNext');
     const btnMobileVoice = document.getElementById('btnMobileVoice');
-    const btnMobileBg = document.getElementById('btnMobileBg');
     const btnMobileHistory = document.getElementById('btnMobileHistory');
 
     // 자막 요소
@@ -743,9 +767,12 @@ export function generateStandaloneHtml(
     function updateMediaSession(text, sentenceIdx, totalSentences, repeat, totalRepeats) {
       if ('mediaSession' in navigator) {
         try {
+          const activeVoiceLabel = voiceMode === 'custom'
+            ? ('🗣️ ' + ((englishVoices.find(v => v.voiceURI === selectedVoiceURI) || {}).name || '선택한 영어 음성'))
+            : (currentGender === 'female' ? '👩 여성 음성' : '👨 남성 음성');
           navigator.mediaSession.metadata = new MediaMetadata({
             title: text || '영어 문장 반복 청취',
-            artist: (currentGender === 'female' ? '👩 여성 음성' : '👨 남성 음성') + ' · RepeatEcho',
+            artist: activeVoiceLabel + ' · RepeatEcho',
             album: \`문장 \${sentenceIdx + 1}/\${totalSentences} · 반복 \${repeat}/\${totalRepeats} · 전체 \${loopCycle}회차\`
           });
 
@@ -1006,19 +1033,94 @@ export function generateStandaloneHtml(
     if (btnPocketNext) btnPocketNext.addEventListener('click', () => { if (currentSentenceIdx < sentences.length - 1) jumpToSentence(currentSentenceIdx + 1); updatePocketDisplay(); });
     if (btnPocketPlay) {
       btnPocketPlay.addEventListener('click', () => {
-        if (!isPlaying) startStudy();
-        else if (isPaused) resumeStudy();
-        else pauseStudy();
+        if (!isPlaying) btnStart.click();
+        else if (isPaused) btnResume.click();
+        else btnPause.click();
         updatePocketDisplay();
       });
     }
 
-    // 음성 로딩
+    // 영어 음성 정규화 및 필터링 (en-US, en-GB 등)
+    function formatVoiceLang(lang) {
+      return (lang || 'en-US').replace('_', '-');
+    }
+
+    function isEnglishVoice(voice) {
+      return Boolean(voice && voice.lang && /^en([-_]|$)/i.test(voice.lang.trim()));
+    }
+
+    function filterEnglishVoices(allVoices) {
+      const seen = new Set();
+      const filtered = [];
+      allVoices.forEach(v => {
+        if (!isEnglishVoice(v)) return;
+        const key = v.voiceURI || (v.name + '_' + v.lang);
+        if (seen.has(key)) return;
+        seen.add(key);
+        filtered.push(v);
+      });
+      const priority = ['en-us', 'en-gb', 'en-au', 'en-ca'];
+      filtered.sort((a, b) => {
+        const la = formatVoiceLang(a.lang).toLowerCase();
+        const lb = formatVoiceLang(b.lang).toLowerCase();
+        const pa = priority.indexOf(la);
+        const pb = priority.indexOf(lb);
+        if (pa !== -1 && pb !== -1 && pa !== pb) return pa - pb;
+        if (pa !== -1 && pb === -1) return -1;
+        if (pa === -1 && pb !== -1) return 1;
+        if (la !== lb) return la.localeCompare(lb);
+        return a.name.localeCompare(b.name);
+      });
+      return filtered;
+    }
+
+    function renderEnglishVoiceSelect() {
+      if (!selectEnglishVoice) return;
+      if (voiceCountBadge) {
+        voiceCountBadge.textContent = englishVoices.length + '개 로드됨';
+      }
+      selectEnglishVoice.innerHTML = '';
+
+      const autoOpt = document.createElement('option');
+      autoOpt.value = '__alternate__';
+      autoOpt.textContent = '👩↔👨 남/녀 자동 교차 (기본 추천)';
+      selectEnglishVoice.appendChild(autoOpt);
+
+      if (englishVoices.length === 0) {
+        const emptyOpt = document.createElement('option');
+        emptyOpt.value = '';
+        emptyOpt.disabled = true;
+        emptyOpt.textContent = '지원되는 영어 음성을 불러오는 중... (새로고침을 눌러주세요)';
+        selectEnglishVoice.appendChild(emptyOpt);
+      } else {
+        englishVoices.forEach(v => {
+          const opt = document.createElement('option');
+          opt.value = v.voiceURI;
+          opt.textContent = v.name + ' (' + formatVoiceLang(v.lang) + ')';
+          selectEnglishVoice.appendChild(opt);
+        });
+      }
+
+      if (voiceMode === 'custom' && selectedVoiceURI && englishVoices.some(v => v.voiceURI === selectedVoiceURI)) {
+        selectEnglishVoice.value = selectedVoiceURI;
+      } else if (voiceMode === 'alternate') {
+        selectEnglishVoice.value = '__alternate__';
+      } else {
+        selectEnglishVoice.value = selectedVoiceURI || '__alternate__';
+      }
+    }
+
+    // 음성 로딩 (모바일 & PC 안정화)
     function loadVoices() {
-      if (!('speechSynthesis' in window)) return;
+      if (!('speechSynthesis' in window)) return [];
       const all = window.speechSynthesis.getVoices();
-      const enVoices = all.filter(v => v.lang.startsWith('en'));
-      const pool = enVoices.length > 0 ? enVoices : all;
+      const filtered = filterEnglishVoices(all);
+      if (filtered.length === 0) {
+        renderEnglishVoiceSelect();
+        return [];
+      }
+
+      englishVoices = filtered;
 
       const femaleHints = ['female', 'samantha', 'victoria', 'zira', 'karen', 'jenny', 'google us english', 'fiona', 'siri voice 2', 'siri voice 4', '여성', '여자'];
       const maleHints = [
@@ -1027,18 +1129,39 @@ export function generateStandaloneHtml(
         'en-us-x-iom', 'en-us-x-iol', 'en-us-x-tpd', 'en-gb-x-rjs', '남성', '남자', 'google uk english male'
       ];
 
-      femaleVoice = pool.find(v => femaleHints.some(h => v.name.toLowerCase().includes(h))) || pool[0];
-      maleVoice = pool.find(v => maleHints.some(h => v.name.toLowerCase().includes(h)));
-      if (!maleVoice && pool.length > 1) {
-        maleVoice = pool.find(v => v !== femaleVoice) || pool[1];
-      } else if (!maleVoice && pool.length > 0) {
-        maleVoice = pool[0];
+      if (!femaleVoice || !filtered.some(v => v.voiceURI === femaleVoice.voiceURI)) {
+        femaleVoice = filtered.find(v => femaleHints.some(h => v.name.toLowerCase().includes(h))) || filtered[0];
       }
+      if (!maleVoice || !filtered.some(v => v.voiceURI === maleVoice.voiceURI)) {
+        maleVoice = filtered.find(v => maleHints.some(h => v.name.toLowerCase().includes(h)));
+        if (!maleVoice && filtered.length > 1) {
+          maleVoice = filtered.find(v => v !== femaleVoice) || filtered[1];
+        } else if (!maleVoice) {
+          maleVoice = filtered[0];
+        }
+      }
+
+      if (!selectedVoiceURI || !filtered.some(v => v.voiceURI === selectedVoiceURI)) {
+        selectedVoiceURI = (femaleVoice && femaleVoice.voiceURI) || filtered[0].voiceURI;
+      }
+
+      renderEnglishVoiceSelect();
+      return filtered;
     }
 
     if ('speechSynthesis' in window) {
       window.speechSynthesis.onvoiceschanged = loadVoices;
-      loadVoices();
+      if (typeof window.speechSynthesis.addEventListener === 'function') {
+        window.speechSynthesis.addEventListener('voiceschanged', loadVoices);
+      }
+      const initial = loadVoices();
+      if (initial.length === 0) {
+        [150, 500, 1200, 2500].forEach(ms => {
+          setTimeout(() => {
+            if (englishVoices.length === 0) loadVoices();
+          }, ms);
+        });
+      }
     }
 
     function parseSentences(txt) {
@@ -1120,7 +1243,11 @@ export function generateStandaloneHtml(
       labelLoop.textContent = isFullLoop ? '전체반복: ON (' + loopCycle + '회차)' : '전체반복: OFF';
       labelSpeed.textContent = rate.toFixed(1) + 'x';
 
-      if (activeGender === 'female') {
+      if (voiceMode === 'custom') {
+        const customVoice = englishVoices.find(v => v.voiceURI === selectedVoiceURI) || englishVoices[0];
+        genderBadge.textContent = '🗣️ ' + (customVoice ? customVoice.name : '선택한 영어 음성');
+        genderBadge.className = 'gender-badge gender-female';
+      } else if (activeGender === 'female') {
         genderBadge.textContent = '👩 여성 음성';
         genderBadge.className = 'gender-badge gender-female';
       } else {
@@ -1137,19 +1264,26 @@ export function generateStandaloneHtml(
       currentUtterance = new SpeechSynthesisUtterance(text);
 
       // 음성 먼저 할당 (속도 리셋 버그 방지)
-      if (activeGender === 'female' && femaleVoice) {
+      const customVoice = voiceMode === 'custom'
+        ? (englishVoices.find(v => v.voiceURI === selectedVoiceURI) || englishVoices[0])
+        : null;
+
+      if (customVoice) {
+        currentUtterance.voice = customVoice;
+        currentUtterance.lang = formatVoiceLang(customVoice.lang);
+      } else if (activeGender === 'female' && femaleVoice) {
         currentUtterance.voice = femaleVoice;
-        currentUtterance.lang = femaleVoice.lang || 'en-US';
+        currentUtterance.lang = formatVoiceLang(femaleVoice.lang);
       } else if (activeGender === 'male' && maleVoice) {
         currentUtterance.voice = maleVoice;
-        currentUtterance.lang = maleVoice.lang || 'en-US';
+        currentUtterance.lang = formatVoiceLang(maleVoice.lang);
       } else {
         currentUtterance.lang = 'en-US';
       }
 
       // voice 지정 후 rate 및 pitch 지정
       currentUtterance.rate = Math.max(0.5, Math.min(2.0, rate));
-      currentUtterance.pitch = activeGender === 'female' ? 1.22 : 0.65;
+      currentUtterance.pitch = customVoice ? 1.0 : (activeGender === 'female' ? 1.22 : 0.65);
 
       currentUtterance.onend = function() {
         if (!isPlaying || isPaused) return;
@@ -1271,14 +1405,24 @@ export function generateStandaloneHtml(
         voiceModeText.textContent = '남녀 교차';
         btnVoiceToggle.classList.add('toggle-active');
         btnMobileVoice.classList.add('toggle-active');
+        btnMobileVoice.textContent = '👥 남녀';
+        if (selectEnglishVoice) selectEnglishVoice.value = '__alternate__';
+      } else if (voiceMode === 'custom') {
+        voiceModeText.textContent = '선택 음성';
+        btnVoiceToggle.classList.add('toggle-active');
+        btnMobileVoice.classList.add('toggle-active');
+        btnMobileVoice.textContent = '🗣️ 선택';
+        if (selectEnglishVoice && selectedVoiceURI) selectEnglishVoice.value = selectedVoiceURI;
       } else if (voiceMode === 'female-only') {
         voiceModeText.textContent = '여성만';
         btnVoiceToggle.classList.remove('toggle-active');
         btnMobileVoice.classList.remove('toggle-active');
+        btnMobileVoice.textContent = '👩 여성';
       } else {
         voiceModeText.textContent = '남성만';
         btnVoiceToggle.classList.remove('toggle-active');
         btnMobileVoice.classList.remove('toggle-active');
+        btnMobileVoice.textContent = '👨 남성';
       }
     }
 
@@ -1288,6 +1432,44 @@ export function generateStandaloneHtml(
       voiceMode = e.target.value;
       updateVoiceModeUI();
     });
+
+    if (selectEnglishVoice) {
+      selectEnglishVoice.addEventListener('change', (e) => {
+        const val = e.target.value;
+        if (val === '__alternate__') {
+          voiceMode = 'alternate';
+        } else if (val) {
+          selectedVoiceURI = val;
+          voiceMode = 'custom';
+        }
+        selectVoiceMode.value = voiceMode;
+        updateVoiceModeUI();
+      });
+    }
+
+    if (btnRefreshVoices) {
+      btnRefreshVoices.addEventListener('click', () => {
+        loadVoices();
+      });
+    }
+
+    if (btnPreviewVoice) {
+      btnPreviewVoice.addEventListener('click', () => {
+        if (!('speechSynthesis' in window)) return;
+        window.speechSynthesis.cancel();
+        const u = new SpeechSynthesisUtterance('Hello! Practice English listening with clear voice playback.');
+        const target = englishVoices.find(v => v.voiceURI === selectedVoiceURI) || femaleVoice || englishVoices[0];
+        if (target) {
+          u.voice = target;
+          u.lang = formatVoiceLang(target.lang);
+        } else {
+          u.lang = 'en-US';
+        }
+        u.rate = Math.max(0.5, Math.min(2.0, rate));
+        u.pitch = 1.0;
+        window.speechSynthesis.speak(u);
+      });
+    }
 
     btnLoopToggle.addEventListener('click', () => {
       isFullLoop = !isFullLoop;
@@ -1392,6 +1574,7 @@ export function generateStandaloneHtml(
     // 초기화
     renderSentenceList();
     updateHistoryBadge();
+    updateVoiceModeUI();
   </script>
 </body>
 </html>`;

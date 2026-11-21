@@ -42,11 +42,19 @@ import {
   Moon,
   Lock,
   Unlock,
-  Radio
+  Radio,
+  Mic
 } from 'lucide-react';
 import { PRESET_LESSONS } from './presets';
 import { generateStandaloneHtml } from './standaloneHtml';
-import { detectVoiceGender, pickBestDefaultVoices, FEMALE_PITCH, MALE_PITCH } from './voiceUtils';
+import {
+  detectVoiceGender,
+  pickBestDefaultVoices,
+  filterEnglishVoices,
+  formatVoiceLang,
+  FEMALE_PITCH,
+  MALE_PITCH
+} from './voiceUtils';
 import {
   StudySessionLog,
   loadStudyLogs,
@@ -74,9 +82,10 @@ export default function App() {
   const [pauseSeconds, setPauseSeconds] = useState<number>(1.0);
   const [playbackRate, setPlaybackRate] = useState<number>(1.0);
 
-  // [기능 1] 남/녀 음성 교차 설정 (Female ↔ Male Alternation)
-  const [voiceMode, setVoiceMode] = useState<'alternate' | 'female-only' | 'male-only'>('alternate');
+  // [기능 1] 남/녀 음성 교차 및 직접 음성 선택 설정
+  const [voiceMode, setVoiceMode] = useState<'alternate' | 'custom' | 'female-only' | 'male-only'>('alternate');
   const [currentGender, setCurrentGender] = useState<'female' | 'male'>('female');
+  const [selectedVoiceURI, setSelectedVoiceURI] = useState<string>('');
   const [femaleVoiceURI, setFemaleVoiceURI] = useState<string>('');
   const [maleVoiceURI, setMaleVoiceURI] = useState<string>('');
 
@@ -131,18 +140,50 @@ export default function App() {
   // Web Speech API Voices
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
 
-  // Refs for speech, rate, and timeout management
+  // Refs for speech, voices, rate, and timeout management (다음 재생부터 즉시 반영 보장)
   const playbackRateRef = useRef<number>(1.0);
+  const voicesRef = useRef<SpeechSynthesisVoice[]>([]);
+  const voiceModeRef = useRef<'alternate' | 'custom' | 'female-only' | 'male-only'>('alternate');
+  const selectedVoiceURIRef = useRef<string>('');
+  const femaleVoiceURIRef = useRef<string>('');
+  const maleVoiceURIRef = useRef<string>('');
+  const repeatCountRef = useRef<number>(3);
+  const pauseSecondsRef = useRef<number>(1.0);
+  const isFullLoopRef = useRef<boolean>(true);
   const pauseTimerRef = useRef<number | null>(null);
   const countdownIntervalRef = useRef<number | null>(null);
   const activeUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const currentSentenceItemRef = useRef<HTMLDivElement | null>(null);
   const listContainerRef = useRef<HTMLDivElement | null>(null);
 
-  // keep playbackRateRef always in sync
+  // keep refs always in sync with state
   useEffect(() => {
     playbackRateRef.current = playbackRate;
   }, [playbackRate]);
+  useEffect(() => {
+    voicesRef.current = voices;
+  }, [voices]);
+  useEffect(() => {
+    voiceModeRef.current = voiceMode;
+  }, [voiceMode]);
+  useEffect(() => {
+    selectedVoiceURIRef.current = selectedVoiceURI;
+  }, [selectedVoiceURI]);
+  useEffect(() => {
+    femaleVoiceURIRef.current = femaleVoiceURI;
+  }, [femaleVoiceURI]);
+  useEffect(() => {
+    maleVoiceURIRef.current = maleVoiceURI;
+  }, [maleVoiceURI]);
+  useEffect(() => {
+    repeatCountRef.current = repeatCount;
+  }, [repeatCount]);
+  useEffect(() => {
+    pauseSecondsRef.current = pauseSeconds;
+  }, [pauseSeconds]);
+  useEffect(() => {
+    isFullLoopRef.current = isFullLoop;
+  }, [isFullLoop]);
 
   // Load study logs on mount
   useEffect(() => {
@@ -186,33 +227,72 @@ export default function App() {
   }, [inputText, splitMode]);
 
   // ==========================================
-  // 3. 브라우저 Web Speech API 음성 및 남/녀 매핑
+  // 3. 브라우저 Web Speech API 영어 음성 안정적 로드 (PC + 모바일 대응)
   // ==========================================
+  const syncEnglishVoices = () => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return [];
+    const allVoices = window.speechSynthesis.getVoices();
+    if (!allVoices || allVoices.length === 0) return [];
+
+    // 영어(en-US, en-GB 등) 음성만 필터링
+    const englishVoices = filterEnglishVoices(allVoices);
+    setVoices(englishVoices);
+    voicesRef.current = englishVoices;
+
+    if (englishVoices.length > 0) {
+      // 사용자가 아직 선택하지 않았거나 기존 선택 음성이 목록에서 사라진 경우에만 기본값 세팅
+      const hasSelected = englishVoices.some((v) => v.voiceURI === selectedVoiceURIRef.current);
+      if (!selectedVoiceURIRef.current || !hasSelected) {
+        const defaultVoice =
+          englishVoices.find((v) => formatVoiceLang(v.lang).toLowerCase() === 'en-us') || englishVoices[0];
+        if (defaultVoice) {
+          setSelectedVoiceURI(defaultVoice.voiceURI);
+          selectedVoiceURIRef.current = defaultVoice.voiceURI;
+        }
+      }
+
+      const best = pickBestDefaultVoices(englishVoices);
+      const hasFemale = englishVoices.some((v) => v.voiceURI === femaleVoiceURIRef.current);
+      if ((!femaleVoiceURIRef.current || !hasFemale) && best.femaleVoice) {
+        setFemaleVoiceURI(best.femaleVoice.voiceURI);
+        femaleVoiceURIRef.current = best.femaleVoice.voiceURI;
+      }
+      const hasMale = englishVoices.some((v) => v.voiceURI === maleVoiceURIRef.current);
+      if ((!maleVoiceURIRef.current || !hasMale) && best.maleVoice) {
+        setMaleVoiceURI(best.maleVoice.voiceURI);
+        maleVoiceURIRef.current = best.maleVoice.voiceURI;
+      }
+    }
+
+    return englishVoices;
+  };
+
   useEffect(() => {
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
 
-    const loadVoices = () => {
-      const allVoices = window.speechSynthesis.getVoices();
-      if (!allVoices || allVoices.length === 0) return;
-
-      const englishVoices = allVoices.filter((v) => v.lang.startsWith('en'));
-      const voiceList = englishVoices.length > 0 ? englishVoices : allVoices;
-      setVoices(voiceList);
-
-      const best = pickBestDefaultVoices(voiceList);
-      if (best.femaleVoice) {
-        setFemaleVoiceURI(best.femaleVoice.voiceURI);
-      }
-      if (best.maleVoice) {
-        setMaleVoiceURI(best.maleVoice.voiceURI);
-      }
+    const handleVoicesChanged = () => {
+      syncEnglishVoices();
     };
 
-    loadVoices();
-    window.speechSynthesis.onvoiceschanged = loadVoices;
+    // 초기 즉시 로드 + voiceschanged 이벤트 리스너 등록
+    const initial = syncEnglishVoices();
+    window.speechSynthesis.addEventListener?.('voiceschanged', handleVoicesChanged);
+    window.speechSynthesis.onvoiceschanged = handleVoicesChanged;
+
+    // 모바일(iOS Safari / Android Chrome) 비동기 지연 로딩 보완 타이머
+    const retryTimers: number[] = [];
+    if (initial.length === 0) {
+      [150, 500, 1200, 2500].forEach((delay) => {
+        retryTimers.push(window.setTimeout(handleVoicesChanged, delay));
+      });
+    }
 
     return () => {
-      window.speechSynthesis.onvoiceschanged = null;
+      retryTimers.forEach((id) => clearTimeout(id));
+      window.speechSynthesis.removeEventListener?.('voiceschanged', handleVoicesChanged);
+      if (window.speechSynthesis.onvoiceschanged === handleVoicesChanged) {
+        window.speechSynthesis.onvoiceschanged = null;
+      }
     };
   }, []);
 
@@ -447,10 +527,14 @@ export default function App() {
 
     const textToSpeak = sentences[sentenceIndex];
     const effectiveRate = Number(playbackRateRef.current || playbackRate || 1.0);
+    const activeMode = voiceModeRef.current;
+    const activeRepeatCount = repeatCountRef.current;
+    const activePauseSeconds = pauseSecondsRef.current;
+    const activeFullLoop = isFullLoopRef.current;
 
     let effectiveGender: 'female' | 'male' = targetGender;
-    if (voiceMode === 'female-only') effectiveGender = 'female';
-    else if (voiceMode === 'male-only') effectiveGender = 'male';
+    if (activeMode === 'female-only') effectiveGender = 'female';
+    else if (activeMode === 'male-only') effectiveGender = 'male';
 
     // -------------------------------------------------------------
     // [엔진 A: MP3 오디오 스트리밍 모드]
@@ -470,7 +554,7 @@ export default function App() {
       updateMediaSessionState(
         textToSpeak,
         '🎵 MP3 화면꺼짐 지원 · RepeatEcho',
-        `문장 ${sentenceIndex + 1}/${sentences.length} · 반복 ${repeatNum}/${repeatCount}회 · 전체 ${loopCycle}회차`,
+        `문장 ${sentenceIndex + 1}/${sentences.length} · 반복 ${repeatNum}/${activeRepeatCount}회 · 전체 ${loopCycle}회차`,
         {
           onPlay: handleResume,
           onPause: handlePause,
@@ -480,21 +564,23 @@ export default function App() {
       );
 
       const handleAudioEnded = () => {
+        const currentMode = voiceModeRef.current;
         const nextGender: 'female' | 'male' =
-          voiceMode === 'alternate' ? (targetGender === 'female' ? 'male' : 'female') : targetGender;
+          currentMode === 'alternate' ? (targetGender === 'female' ? 'male' : 'female') : targetGender;
 
-        if (repeatNum < repeatCount) {
+        if (repeatNum < repeatCountRef.current) {
           pauseTimerRef.current = window.setTimeout(() => {
             speakSentence(sentenceIndex, repeatNum + 1, nextGender);
           }, 300);
         } else {
           const nextIdx = sentenceIndex + 1;
           if (nextIdx < sentences.length) {
-            if (pauseSeconds > 0) {
+            const pSec = pauseSecondsRef.current;
+            if (pSec > 0) {
               setIsResting(true);
-              setRestCountdown(pauseSeconds);
+              setRestCountdown(pSec);
               const startTime = Date.now();
-              const totalDuration = pauseSeconds * 1000;
+              const totalDuration = pSec * 1000;
 
               countdownIntervalRef.current = window.setInterval(() => {
                 const elapsed = Date.now() - startTime;
@@ -514,7 +600,7 @@ export default function App() {
               speakSentence(nextIdx, 1, nextGender);
             }
           } else {
-            if (isFullLoop && sentences.length > 0) {
+            if (activeFullLoop && sentences.length > 0) {
               setLoopCycle((prev) => prev + 1);
               setIsResting(true);
               setRestCountdown(1.0);
@@ -551,7 +637,7 @@ export default function App() {
 
     // -------------------------------------------------------------
     // [엔진 B: 브라우저 내장 Web Speech API]
-    // 남/녀 음성 교차 및 0.65x 딥 바리톤 피치 변조 지원
+    // 선택한 영어 음성(custom) 또는 남/녀 교차 및 피치 변조 지원
     // -------------------------------------------------------------
     speakWithWebSpeech(sentenceIndex, repeatNum, targetGender, effectiveGender, textToSpeak, effectiveRate);
   };
@@ -572,30 +658,49 @@ export default function App() {
     const utterance = new SpeechSynthesisUtterance(textToSpeak);
     activeUtteranceRef.current = utterance;
 
-    // 음성 객체 먼저 할당 (Chromium 브라우저의 속도 리셋 방지)
+    // 항상 최신 Ref에서 음성 목록 및 선택값 조회 (재생 중 변경 시 다음 재생부터 즉시 반영)
+    const currentVoices = voicesRef.current;
+    const currentMode = voiceModeRef.current;
     let selectedVoice: SpeechSynthesisVoice | undefined;
-    if (effectiveGender === 'female' && femaleVoiceURI) {
-      selectedVoice = voices.find((item) => item.voiceURI === femaleVoiceURI);
-    } else if (effectiveGender === 'male' && maleVoiceURI) {
-      selectedVoice = voices.find((item) => item.voiceURI === maleVoiceURI);
+
+    if (currentMode === 'custom') {
+      const targetURI = selectedVoiceURIRef.current;
+      selectedVoice =
+        (targetURI ? currentVoices.find((item) => item.voiceURI === targetURI) : undefined) ||
+        currentVoices[0];
+    } else if (effectiveGender === 'female' && femaleVoiceURIRef.current) {
+      selectedVoice = currentVoices.find((item) => item.voiceURI === femaleVoiceURIRef.current);
+    } else if (effectiveGender === 'male' && maleVoiceURIRef.current) {
+      selectedVoice = currentVoices.find((item) => item.voiceURI === maleVoiceURIRef.current);
     }
 
+    // 음성 객체 먼저 할당 (Chromium 브라우저의 속도 리셋 방지)
     if (selectedVoice) {
       utterance.voice = selectedVoice;
-      utterance.lang = selectedVoice.lang || 'en-US';
+      utterance.lang = formatVoiceLang(selectedVoice.lang);
     } else {
       utterance.lang = 'en-US';
     }
 
     // voice 할당 후에 rate와 pitch를 설정
     utterance.rate = Math.max(0.5, Math.min(2.0, effectiveRate));
-    utterance.pitch = effectiveGender === 'female' ? FEMALE_PITCH : MALE_PITCH;
+    utterance.pitch =
+      currentMode === 'custom'
+        ? 1.0
+        : effectiveGender === 'female'
+          ? FEMALE_PITCH
+          : MALE_PITCH;
 
     // 잠금 화면 / 블루투스 컨트롤 메타데이터 실시간 갱신 (MediaSession API)
+    const artistLabel =
+      currentMode === 'custom' && selectedVoice
+        ? `🎙 ${selectedVoice.name} (${formatVoiceLang(selectedVoice.lang)}) · RepeatEcho`
+        : (effectiveGender === 'female' ? '👩 여성 발음' : '👨 남성 발음') + ' · RepeatEcho';
+
     updateMediaSessionState(
       textToSpeak,
-      (effectiveGender === 'female' ? '👩 여성 발음' : '👨 남성 발음') + ' · RepeatEcho',
-      `문장 ${sentenceIndex + 1}/${sentences.length} · 반복 ${repeatNum}/${repeatCount}회 · 전체 ${loopCycle}회차`,
+      artistLabel,
+      `문장 ${sentenceIndex + 1}/${sentences.length} · 반복 ${repeatNum}/${repeatCountRef.current}회 · 전체 ${loopCycle}회차`,
       {
         onPlay: handleResume,
         onPause: handlePause,
@@ -614,14 +719,15 @@ export default function App() {
       }
     };
 
-    // 문장 읽기 종료 시 처리 (남/녀 교차 전환)
+    // 문장 읽기 종료 시 처리 (다음 재생에서 최신 선택 음성 즉시 반영)
     utterance.onend = () => {
       setActiveWordCharRange(null);
 
+      const latestMode = voiceModeRef.current;
       const nextGender: 'female' | 'male' =
-        voiceMode === 'alternate' ? (targetGender === 'female' ? 'male' : 'female') : targetGender;
+        latestMode === 'alternate' ? (targetGender === 'female' ? 'male' : 'female') : targetGender;
 
-      if (repeatNum < repeatCount) {
+      if (repeatNum < repeatCountRef.current) {
         pauseTimerRef.current = window.setTimeout(() => {
           speakSentence(sentenceIndex, repeatNum + 1, nextGender);
         }, 300);
@@ -629,12 +735,13 @@ export default function App() {
         const nextIdx = sentenceIndex + 1;
 
         if (nextIdx < sentences.length) {
-          if (pauseSeconds > 0) {
+          const pSec = pauseSecondsRef.current;
+          if (pSec > 0) {
             setIsResting(true);
-            setRestCountdown(pauseSeconds);
+            setRestCountdown(pSec);
 
             const startTime = Date.now();
-            const totalDuration = pauseSeconds * 1000;
+            const totalDuration = pSec * 1000;
 
             countdownIntervalRef.current = window.setInterval(() => {
               const elapsed = Date.now() - startTime;
@@ -658,7 +765,7 @@ export default function App() {
           }
         } else {
           // 마지막 문장 종료 -> 전체 반복 여부 판별
-          if (isFullLoop && sentences.length > 0) {
+          if (isFullLoopRef.current && sentences.length > 0) {
             setLoopCycle((prev) => prev + 1);
             setIsResting(true);
             setRestCountdown(1.0);
@@ -690,49 +797,81 @@ export default function App() {
   };
 
   // 음성 테스트 (미리듣기)
-  const handleTestVoice = (gender: 'female' | 'male') => {
+  const handleTestVoice = (target: 'female' | 'male' | 'custom') => {
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
       alert('현재 브라우저에서는 음성 합성을 지원하지 않습니다.');
       return;
     }
     window.speechSynthesis.cancel();
 
-    const targetURI = gender === 'female' ? femaleVoiceURI : maleVoiceURI;
+    const currentVoices = voicesRef.current;
+    const targetURI =
+      target === 'custom'
+        ? selectedVoiceURIRef.current
+        : target === 'female'
+          ? femaleVoiceURIRef.current
+          : maleVoiceURIRef.current;
+
     const sampleText =
-      gender === 'female'
-        ? 'Hello! This is the female voice sample.'
-        : 'Hello! This is the male voice sample.';
+      target === 'custom'
+        ? 'Hello! This is your selected English voice.'
+        : target === 'female'
+          ? 'Hello! This is the female voice sample.'
+          : 'Hello! This is the male voice sample.';
 
     const utterance = new SpeechSynthesisUtterance(sampleText);
-    if (targetURI) {
-      const selected = voices.find((v) => v.voiceURI === targetURI);
-      if (selected) {
-        utterance.voice = selected;
-        utterance.lang = selected.lang || 'en-US';
-      }
+    const selected = targetURI ? currentVoices.find((v) => v.voiceURI === targetURI) : currentVoices[0];
+    if (selected) {
+      utterance.voice = selected;
+      utterance.lang = formatVoiceLang(selected.lang);
     } else {
       utterance.lang = 'en-US';
     }
 
     utterance.rate = Math.max(0.5, Math.min(2.0, Number(playbackRateRef.current || playbackRate || 1.0)));
-    utterance.pitch = gender === 'female' ? FEMALE_PITCH : MALE_PITCH;
+    utterance.pitch = target === 'custom' ? 1.0 : target === 'female' ? FEMALE_PITCH : MALE_PITCH;
 
     window.speechSynthesis.speak(utterance);
+  };
+
+  // 메인 영어 음성(Voice) 드롭다운 직접 선택 핸들러
+  const handleSelectDirectVoice = (value: string) => {
+    if (value === '__alternate__') {
+      setVoiceMode('alternate');
+      voiceModeRef.current = 'alternate';
+      setShowSaveSuccessToast('👩↔👨 남/녀 음성 교차 모드로 전환되었습니다. 다음 재생부터 적용됩니다.');
+      setTimeout(() => setShowSaveSuccessToast(null), 2500);
+      return;
+    }
+
+    setSelectedVoiceURI(value);
+    selectedVoiceURIRef.current = value;
+    setVoiceMode('custom');
+    voiceModeRef.current = 'custom';
+
+    if (audioEngine === 'mp3') {
+      setAudioEngine('webspeech');
+    }
+
+    const found = voicesRef.current.find((v) => v.voiceURI === value);
+    if (found) {
+      setShowSaveSuccessToast(
+        `🎙 ${found.name} (${formatVoiceLang(found.lang)}) 선택됨 — 다음 재생부터 즉시 적용됩니다.`
+      );
+      setTimeout(() => setShowSaveSuccessToast(null), 2800);
+    }
   };
 
   // 기기 음성 목록 수동 새로고침
   const handleRefreshVoices = () => {
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
-    const allVoices = window.speechSynthesis.getVoices();
-    if (allVoices && allVoices.length > 0) {
-      const englishVoices = allVoices.filter((v) => v.lang.startsWith('en'));
-      const voiceList = englishVoices.length > 0 ? englishVoices : allVoices;
-      setVoices(voiceList);
-      setShowSaveSuccessToast(`기기 음성 목록을 새로고침했습니다 (${voiceList.length}개 발견).`);
+    const loaded = syncEnglishVoices();
+    if (loaded.length > 0) {
+      setShowSaveSuccessToast(`영어 음성 목록을 새로고침했습니다 (${loaded.length}개 영어 음성 발견).`);
       setTimeout(() => setShowSaveSuccessToast(null), 2500);
     } else {
-      setShowSaveSuccessToast('음성 목록을 다시 확인했습니다.');
-      setTimeout(() => setShowSaveSuccessToast(null), 2000);
+      setShowSaveSuccessToast('사용 가능한 영어 음성을 다시 확인했습니다. 기기 TTS 설정을 확인해 주세요.');
+      setTimeout(() => setShowSaveSuccessToast(null), 2500);
     }
   };
 
@@ -849,9 +988,16 @@ export default function App() {
   // 음성 모드 토글
   const cycleVoiceMode = () => {
     setVoiceMode((prev) => {
-      if (prev === 'alternate') return 'female-only';
-      if (prev === 'female-only') return 'male-only';
-      return 'alternate';
+      const next =
+        prev === 'alternate'
+          ? 'custom'
+          : prev === 'custom'
+            ? 'female-only'
+            : prev === 'female-only'
+              ? 'male-only'
+              : 'alternate';
+      voiceModeRef.current = next;
+      return next;
     });
   };
 
@@ -949,6 +1095,7 @@ export default function App() {
 
   const currentSentenceText = sentences[currentSentenceIdx] || '';
   const activeDisplayGender = voiceMode === 'female-only' ? 'female' : voiceMode === 'male-only' ? 'male' : currentGender;
+  const selectedVoiceObj = voices.find((v) => v.voiceURI === selectedVoiceURI) || voices[0];
 
   // 통계 계산
   const studyStats = useMemo(() => calculateStudyStats(studyLogs), [studyLogs]);
@@ -1179,19 +1326,30 @@ export default function App() {
               </span>
               <span className="text-slate-700">·</span>
 
-              {/* 실시간 발화 성별 뱃지 */}
-              <div
-                className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold transition-all shadow-xs ${
-                  activeDisplayGender === 'female'
-                    ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
-                    : 'bg-sky-500/20 text-sky-300 border border-sky-500/40'
-                }`}
-              >
-                <span>{activeDisplayGender === 'female' ? '👩 여성 음성' : '👨 남성 음성'}</span>
-                {voiceMode === 'alternate' && (
-                  <span className="text-[10px] text-slate-400 font-normal">(교차중)</span>
-                )}
-              </div>
+              {/* 실시간 발화 음성 / 성별 뱃지 */}
+              {voiceMode === 'custom' ? (
+                <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold transition-all shadow-xs bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 max-w-[220px] truncate">
+                  <Mic className="w-3 h-3 shrink-0" />
+                  <span className="truncate">
+                    {selectedVoiceObj
+                      ? `${selectedVoiceObj.name} (${formatVoiceLang(selectedVoiceObj.lang)})`
+                      : '선택한 영어 음성'}
+                  </span>
+                </div>
+              ) : (
+                <div
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold transition-all shadow-xs ${
+                    activeDisplayGender === 'female'
+                      ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+                      : 'bg-sky-500/20 text-sky-300 border border-sky-500/40'
+                  }`}
+                >
+                  <span>{activeDisplayGender === 'female' ? '👩 여성 음성' : '👨 남성 음성'}</span>
+                  {voiceMode === 'alternate' && (
+                    <span className="text-[10px] text-slate-400 font-normal">(교차중)</span>
+                  )}
+                </div>
+              )}
 
               <span className="text-slate-700">·</span>
 
@@ -1426,123 +1584,211 @@ export default function App() {
         </div>
 
         {/* ---------------------------------------------------------
-            2. 메인 컨트롤 툴바 (Desktop / Tablet용)
+            2. 메인 컨트롤 툴바 (Mobile & Desktop 공통)
             --------------------------------------------------------- */}
         <section
           className={`${
             mobileTab !== 'theater' ? 'hidden md:flex' : 'flex'
-          } bg-white rounded-2xl p-4 sm:p-5 border border-slate-200/90 shadow-xs flex-wrap items-center justify-between gap-3`}
+          } bg-white rounded-2xl p-4 sm:p-5 border border-slate-200/90 shadow-xs flex-col gap-3`}
         >
-          <div className="flex items-center flex-wrap gap-2 w-full sm:w-auto">
-            {!isPlaying || isPaused ? (
-              <button
-                onClick={isPaused ? handleResume : handleStart}
-                disabled={sentences.length === 0}
-                className="flex-1 sm:flex-initial px-5 py-2.5 bg-indigo-600 text-white rounded-xl font-semibold text-sm hover:bg-indigo-700 active:scale-[0.98] transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 shadow-xs min-h-[44px]"
-              >
-                <Play className="w-4 h-4 fill-white" />
-                <span>{isPaused ? '재개' : '학습 시작'}</span>
-              </button>
-            ) : (
-              <button
-                onClick={handlePause}
-                className="flex-1 sm:flex-initial px-5 py-2.5 bg-slate-800 text-white rounded-xl font-semibold text-sm hover:bg-slate-700 active:scale-[0.98] transition-all flex items-center justify-center gap-2 cursor-pointer shadow-xs min-h-[44px]"
-              >
-                <Pause className="w-4 h-4" />
-                <span>일시정지</span>
-              </button>
-            )}
-
-            <button
-              onClick={handleStop}
-              disabled={!isPlaying && !isPaused}
-              className="p-2.5 rounded-xl border border-slate-200 text-slate-700 hover:bg-rose-50 hover:text-rose-600 hover:border-rose-200 transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer min-h-[44px] min-w-[44px] flex items-center justify-center"
-              title="정지 (처음부터 다시)"
-            >
-              <RotateCcw className="w-4 h-4" />
-            </button>
-
-            {/* 음성 교차 모드 원터치 전환 버튼 */}
-            <button
-              onClick={cycleVoiceMode}
-              className={`px-3 py-2.5 rounded-xl border font-semibold text-xs flex items-center gap-1.5 transition-all cursor-pointer min-h-[44px] ${
-                voiceMode === 'alternate'
-                  ? 'bg-purple-50 border-purple-300 text-purple-700 shadow-xs'
-                  : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-100'
-              }`}
-              title="클릭하여 남/녀 교차, 여성 전용, 남성 전용 모드로 순환 변경합니다"
-            >
-              <Users className={`w-4 h-4 ${voiceMode === 'alternate' ? 'text-purple-600' : 'text-slate-400'}`} />
-              <span>
-                음성: <strong className={voiceMode === 'alternate' ? 'text-purple-700' : 'text-slate-700'}>
-                  {voiceMode === 'alternate' ? '👩↔👨 남녀교차' : voiceMode === 'female-only' ? '👩 여성만' : '👨 남성만'}
-                </strong>
-              </span>
-            </button>
-
-            {/* 전체 반복 토글 버튼 */}
-            <button
-              onClick={() => setIsFullLoop(!isFullLoop)}
-              className={`px-3 py-2.5 rounded-xl border font-semibold text-xs flex items-center gap-1.5 transition-all cursor-pointer min-h-[44px] ${
-                isFullLoop
-                  ? 'bg-indigo-50 border-indigo-300 text-indigo-700 shadow-xs'
-                  : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-100'
-              }`}
-              title="모든 문장을 다 읽은 후 처음부터 다시 무한 반복합니다"
-            >
-              <Repeat className={`w-4 h-4 ${isFullLoop ? 'text-indigo-600' : 'text-slate-400'}`} />
-              <span>전체 반복: <strong className={isFullLoop ? 'text-indigo-700' : 'text-slate-500'}>{isFullLoop ? 'ON' : 'OFF'}</strong></span>
-            </button>
-
-            <div className="hidden sm:block h-6 w-px bg-slate-200 mx-1" />
-
-            <div className="flex items-center gap-1">
-              <button
-                onClick={handlePrevSentence}
-                disabled={!isPlaying || currentSentenceIdx <= 0}
-                className="p-2.5 rounded-xl border border-slate-200 text-slate-700 hover:bg-slate-100 transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer min-h-[44px] min-w-[44px] flex items-center justify-center"
-                title="이전 문장 (← 키)"
-              >
-                <SkipBack className="w-4 h-4" />
-              </button>
+          <div className="flex flex-wrap items-center justify-between gap-3 w-full">
+            <div className="flex items-center flex-wrap gap-2 w-full sm:w-auto">
+              {!isPlaying || isPaused ? (
+                <button
+                  onClick={isPaused ? handleResume : handleStart}
+                  disabled={sentences.length === 0}
+                  className="flex-1 sm:flex-initial px-5 py-2.5 bg-indigo-600 text-white rounded-xl font-semibold text-sm hover:bg-indigo-700 active:scale-[0.98] transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 shadow-xs min-h-[44px]"
+                >
+                  <Play className="w-4 h-4 fill-white" />
+                  <span>{isPaused ? '재개' : '학습 시작'}</span>
+                </button>
+              ) : (
+                <button
+                  onClick={handlePause}
+                  className="flex-1 sm:flex-initial px-5 py-2.5 bg-slate-800 text-white rounded-xl font-semibold text-sm hover:bg-slate-700 active:scale-[0.98] transition-all flex items-center justify-center gap-2 cursor-pointer shadow-xs min-h-[44px]"
+                >
+                  <Pause className="w-4 h-4" />
+                  <span>일시정지</span>
+                </button>
+              )}
 
               <button
-                onClick={handleReplayCurrent}
-                disabled={sentences.length === 0}
-                className="px-3 py-2 rounded-xl border border-slate-200 text-slate-700 hover:bg-indigo-50 hover:text-indigo-600 transition-colors text-xs font-semibold flex items-center gap-1 cursor-pointer min-h-[44px]"
-                title="현재 문장 다시 듣기 (R 키)"
+                onClick={handleStop}
+                disabled={!isPlaying && !isPaused}
+                className="p-2.5 rounded-xl border border-slate-200 text-slate-700 hover:bg-rose-50 hover:text-rose-600 hover:border-rose-200 transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer min-h-[44px] min-w-[44px] flex items-center justify-center"
+                title="정지 (처음부터 다시)"
               >
-                <RefreshCw className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">현재 문장 다시</span>
+                <RotateCcw className="w-4 h-4" />
               </button>
 
+              {/* 음성 모드 원터치 전환 버튼 */}
               <button
-                onClick={handleNextSentence}
-                disabled={!isPlaying || currentSentenceIdx >= sentences.length - 1}
-                className="p-2.5 rounded-xl border border-slate-200 text-slate-700 hover:bg-slate-100 transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer min-h-[44px] min-w-[44px] flex items-center justify-center"
-                title="다음 문장 (→ 키)"
+                onClick={cycleVoiceMode}
+                className={`px-3 py-2.5 rounded-xl border font-semibold text-xs flex items-center gap-1.5 transition-all cursor-pointer min-h-[44px] ${
+                  voiceMode === 'alternate'
+                    ? 'bg-purple-50 border-purple-300 text-purple-700 shadow-xs'
+                    : voiceMode === 'custom'
+                      ? 'bg-emerald-50 border-emerald-300 text-emerald-700 shadow-xs'
+                      : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-100'
+                }`}
+                title="클릭하여 남/녀 교차, 직접선택, 여성 전용, 남성 전용 모드로 순환 변경합니다"
               >
-                <SkipForward className="w-4 h-4" />
+                <Users
+                  className={`w-4 h-4 ${
+                    voiceMode === 'alternate'
+                      ? 'text-purple-600'
+                      : voiceMode === 'custom'
+                        ? 'text-emerald-600'
+                        : 'text-slate-400'
+                  }`}
+                />
+                <span>
+                  음성:{' '}
+                  <strong
+                    className={
+                      voiceMode === 'alternate'
+                        ? 'text-purple-700'
+                        : voiceMode === 'custom'
+                          ? 'text-emerald-700'
+                          : 'text-slate-700'
+                    }
+                  >
+                    {voiceMode === 'alternate'
+                      ? '👩↔👨 남녀교차'
+                      : voiceMode === 'custom'
+                        ? '🎙 직접선택'
+                        : voiceMode === 'female-only'
+                          ? '👩 여성만'
+                          : '👨 남성만'}
+                  </strong>
+                </span>
               </button>
+
+              {/* 전체 반복 토글 버튼 */}
+              <button
+                onClick={() => setIsFullLoop(!isFullLoop)}
+                className={`px-3 py-2.5 rounded-xl border font-semibold text-xs flex items-center gap-1.5 transition-all cursor-pointer min-h-[44px] ${
+                  isFullLoop
+                    ? 'bg-indigo-50 border-indigo-300 text-indigo-700 shadow-xs'
+                    : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-100'
+                }`}
+                title="모든 문장을 다 읽은 후 처음부터 다시 무한 반복합니다"
+              >
+                <Repeat className={`w-4 h-4 ${isFullLoop ? 'text-indigo-600' : 'text-slate-400'}`} />
+                <span>
+                  전체 반복: <strong className={isFullLoop ? 'text-indigo-700' : 'text-slate-500'}>{isFullLoop ? 'ON' : 'OFF'}</strong>
+                </span>
+              </button>
+
+              <div className="hidden sm:block h-6 w-px bg-slate-200 mx-1" />
+
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={handlePrevSentence}
+                  disabled={!isPlaying || currentSentenceIdx <= 0}
+                  className="p-2.5 rounded-xl border border-slate-200 text-slate-700 hover:bg-slate-100 transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer min-h-[44px] min-w-[44px] flex items-center justify-center"
+                  title="이전 문장 (← 키)"
+                >
+                  <SkipBack className="w-4 h-4" />
+                </button>
+
+                <button
+                  onClick={handleReplayCurrent}
+                  disabled={sentences.length === 0}
+                  className="px-3 py-2 rounded-xl border border-slate-200 text-slate-700 hover:bg-indigo-50 hover:text-indigo-600 transition-colors text-xs font-semibold flex items-center gap-1 cursor-pointer min-h-[44px]"
+                  title="현재 문장 다시 듣기 (R 키)"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">현재 문장 다시</span>
+                </button>
+
+                <button
+                  onClick={handleNextSentence}
+                  disabled={!isPlaying || currentSentenceIdx >= sentences.length - 1}
+                  className="p-2.5 rounded-xl border border-slate-200 text-slate-700 hover:bg-slate-100 transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer min-h-[44px] min-w-[44px] flex items-center justify-center"
+                  title="다음 문장 (→ 키)"
+                >
+                  <SkipForward className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* 배속 조절 퀵 버튼 (실시간 반영) */}
+            <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-xl">
+              {[0.75, 1.0, 1.25, 1.5, 1.75].map((rate) => (
+                <button
+                  key={rate}
+                  onClick={() => handlePlaybackRateChange(rate)}
+                  className={`px-2.5 py-1 text-xs font-semibold rounded-lg transition-colors cursor-pointer tabular-nums min-h-[36px] ${
+                    playbackRate === rate
+                      ? 'bg-white text-indigo-700 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                  title={`${rate}배속으로 즉시 변경`}
+                >
+                  {rate.toFixed(2).replace(/\.00$/, '')}x
+                </button>
+              ))}
             </div>
           </div>
 
-          {/* 배속 조절 퀵 버튼 (실시간 반영) */}
-          <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-xl">
-            {[0.75, 1.0, 1.25, 1.5, 1.75].map((rate) => (
-              <button
-                key={rate}
-                onClick={() => handlePlaybackRateChange(rate)}
-                className={`px-2.5 py-1 text-xs font-semibold rounded-lg transition-colors cursor-pointer tabular-nums min-h-[36px] ${
-                  playbackRate === rate
-                    ? 'bg-white text-indigo-700 shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-                title={`${rate}배속으로 즉시 변경`}
+          {/* [신규] 영어 음성(Voice) 직접 선택 드롭다운 바 (PC + 모바일 즉시 노출) */}
+          <div className="pt-3 border-t border-slate-100 flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
+            <div className="flex items-center gap-2 shrink-0">
+              <div className="w-7 h-7 rounded-lg bg-indigo-50 text-indigo-600 flex items-center justify-center">
+                <Mic className="w-4 h-4" />
+              </div>
+              <label htmlFor="quickEnglishVoiceSelect" className="text-xs font-bold text-slate-800 whitespace-nowrap">
+                영어 음성 선택
+              </label>
+              <span className="px-2 py-0.5 rounded-md bg-slate-100 text-slate-600 text-[11px] font-semibold tabular-nums">
+                {voices.length}개 영어 음성
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2 flex-1 min-w-0">
+              <select
+                id="quickEnglishVoiceSelect"
+                value={voiceMode === 'alternate' ? '__alternate__' : selectedVoiceURI}
+                onChange={(e) => handleSelectDirectVoice(e.target.value)}
+                className="flex-1 min-w-0 text-xs sm:text-sm py-2 px-3 rounded-xl border border-slate-200 bg-slate-50/70 hover:bg-white text-slate-800 font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-600 cursor-pointer truncate min-h-[44px]"
+                aria-label="영어 음성 선택"
               >
-                {rate.toFixed(2).replace(/\.00$/, '')}x
+                <option value="__alternate__">👩↔👨 남/녀 번갈아 교차 모드 (자동)</option>
+                {voices.length > 0 ? (
+                  voices.map((v) => (
+                    <option key={v.voiceURI} value={v.voiceURI}>
+                      {v.name} ({formatVoiceLang(v.lang)})
+                    </option>
+                  ))
+                ) : (
+                  <option value="" disabled>
+                    기기에서 영어 음성을 불러오는 중...
+                  </option>
+                )}
+              </select>
+
+              <button
+                type="button"
+                onClick={() => handleTestVoice(voiceMode === 'alternate' ? currentGender : 'custom')}
+                disabled={voices.length === 0}
+                className="px-3 py-2 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer shrink-0 min-h-[44px] disabled:opacity-40 active:scale-95"
+                title="선택한 영어 음성 미리듣기"
+              >
+                <Volume2 className="w-4 h-4" />
+                <span className="hidden sm:inline">미리듣기</span>
               </button>
-            ))}
+
+              <button
+                type="button"
+                onClick={handleRefreshVoices}
+                className="p-2.5 rounded-xl bg-white hover:bg-slate-100 text-slate-600 border border-slate-200 cursor-pointer shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center"
+                title="기기 영어 음성 목록 새로고침"
+                aria-label="기기 영어 음성 목록 새로고침"
+              >
+                <RefreshCw className="w-4 h-4" />
+              </button>
+            </div>
           </div>
         </section>
 
@@ -1568,15 +1814,26 @@ export default function App() {
               <label className="text-xs font-semibold text-slate-700 flex items-center justify-between">
                 <span>음성 발화 방식</span>
                 <span className="text-purple-600 font-bold text-[11px]">
-                  {voiceMode === 'alternate' ? '남/녀 번갈아 교차' : voiceMode === 'female-only' ? '여성만' : '남성만'}
+                  {voiceMode === 'alternate'
+                    ? '남/녀 번갈아 교차'
+                    : voiceMode === 'custom'
+                      ? '직접 선택한 음성'
+                      : voiceMode === 'female-only'
+                        ? '여성만'
+                        : '남성만'}
                 </span>
               </label>
               <select
                 value={voiceMode}
-                onChange={(e) => setVoiceMode(e.target.value as any)}
+                onChange={(e) => {
+                  const next = e.target.value as 'alternate' | 'custom' | 'female-only' | 'male-only';
+                  setVoiceMode(next);
+                  voiceModeRef.current = next;
+                }}
                 className="w-full text-xs py-2 px-2.5 rounded-lg border border-slate-200 bg-white text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-600 cursor-pointer min-h-[44px]"
               >
                 <option value="alternate">👩 ↔ 👨 남/녀 번갈아 교차 (추천)</option>
+                <option value="custom">🎙 직접 선택한 영어 음성 사용</option>
                 <option value="female-only">👩 여성 음성만 사용</option>
                 <option value="male-only">👨 남성 음성만 사용</option>
               </select>
@@ -1683,68 +1940,126 @@ export default function App() {
             </div>
           </div>
 
-          {/* 세부 음성 매핑 (여성 음성 / 남성 음성 개별 선택 드롭다운 & 미리듣기) */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-4 pt-3 border-t border-slate-100">
-            {/* 여성 음성 */}
-            <div className="flex flex-col gap-1.5 bg-rose-50/40 p-3 rounded-xl border border-rose-100">
+          {/* 세부 음성 매핑 (직접 영어 음성 / 여성 음성 / 남성 음성 선택 드롭다운 & 미리듣기) */}
+          <div className="mt-4 pt-3 border-t border-slate-100 flex flex-col gap-3">
+            {/* 직접 선택한 단일 영어 음성 */}
+            <div className="flex flex-col gap-1.5 bg-emerald-50/40 p-3 rounded-xl border border-emerald-200/80">
               <div className="flex items-center justify-between">
-                <label className="text-xs font-semibold text-rose-800 flex items-center gap-1.5">
-                  <span>👩 지정 여성 음성</span>
-                  <span className="text-slate-400 font-normal text-[11px]">· 1.22x 고음역</span>
+                <label htmlFor="settingsCustomVoiceSelect" className="text-xs font-semibold text-emerald-900 flex items-center gap-1.5">
+                  <Mic className="w-3.5 h-3.5 text-emerald-700" />
+                  <span>직접 영어 음성 선택 (선택 시 다음 재생부터 즉시 적용)</span>
                 </label>
                 <button
                   type="button"
-                  onClick={() => handleTestVoice('female')}
-                  className="px-2.5 py-1 rounded-lg bg-rose-100 hover:bg-rose-200 text-rose-800 text-[11px] font-bold border border-rose-300/80 transition-colors flex items-center gap-1 cursor-pointer active:scale-95 shadow-2xs"
-                  title="여성 음성 샘플 미리듣기"
+                  onClick={() => handleTestVoice('custom')}
+                  disabled={voices.length === 0}
+                  className="px-2.5 py-1 rounded-lg bg-emerald-100 hover:bg-emerald-200 text-emerald-800 text-[11px] font-bold border border-emerald-300/80 transition-colors flex items-center gap-1 cursor-pointer active:scale-95 shadow-2xs disabled:opacity-40"
+                  title="선택한 영어 음성 미리듣기"
                 >
                   <Volume2 className="w-3.5 h-3.5" />
                   <span>🔊 미리듣기</span>
                 </button>
               </div>
               <select
-                value={femaleVoiceURI}
-                onChange={(e) => setFemaleVoiceURI(e.target.value)}
-                className="w-full text-xs py-2 px-2.5 rounded-lg border border-slate-200 bg-white text-slate-800 focus:outline-none focus:ring-2 focus:ring-rose-500/20 focus:border-rose-500 cursor-pointer truncate min-h-[44px]"
+                id="settingsCustomVoiceSelect"
+                value={selectedVoiceURI}
+                onChange={(e) => handleSelectDirectVoice(e.target.value)}
+                className="w-full text-xs py-2 px-2.5 rounded-lg border border-slate-200 bg-white text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 cursor-pointer truncate min-h-[44px]"
               >
-                {voices.map((v) => (
-                  <option key={v.voiceURI} value={v.voiceURI}>
-                    {detectVoiceGender(v) === 'female' ? '👩 [여성추천] ' : '🗣 '}
-                    {v.name} ({v.lang})
+                {voices.length > 0 ? (
+                  voices.map((v) => (
+                    <option key={v.voiceURI} value={v.voiceURI}>
+                      {v.name} ({formatVoiceLang(v.lang)})
+                    </option>
+                  ))
+                ) : (
+                  <option value="" disabled>
+                    사용 가능한 영어 음성을 불러오는 중...
                   </option>
-                ))}
+                )}
               </select>
             </div>
 
-            {/* 남성 음성 */}
-            <div className="flex flex-col gap-1.5 bg-sky-50/40 p-3 rounded-xl border border-sky-100">
-              <div className="flex items-center justify-between">
-                <label className="text-xs font-semibold text-sky-800 flex items-center gap-1.5">
-                  <span>👨 지정 남성 음성</span>
-                  <span className="text-slate-400 font-normal text-[11px]">· 0.65x 딥 바리톤</span>
-                </label>
-                <button
-                  type="button"
-                  onClick={() => handleTestVoice('male')}
-                  className="px-2.5 py-1 rounded-lg bg-sky-100 hover:bg-sky-200 text-sky-800 text-[11px] font-bold border border-sky-300/80 transition-colors flex items-center gap-1 cursor-pointer active:scale-95 shadow-2xs"
-                  title="남성 음성 샘플 미리듣기 (0.65x 저음 자동 보정)"
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {/* 여성 음성 */}
+              <div className="flex flex-col gap-1.5 bg-rose-50/40 p-3 rounded-xl border border-rose-100">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-semibold text-rose-800 flex items-center gap-1.5">
+                    <span>👩 지정 여성 음성</span>
+                    <span className="text-slate-400 font-normal text-[11px]">· 1.22x 고음역</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => handleTestVoice('female')}
+                    className="px-2.5 py-1 rounded-lg bg-rose-100 hover:bg-rose-200 text-rose-800 text-[11px] font-bold border border-rose-300/80 transition-colors flex items-center gap-1 cursor-pointer active:scale-95 shadow-2xs"
+                    title="여성 음성 샘플 미리듣기"
+                  >
+                    <Volume2 className="w-3.5 h-3.5" />
+                    <span>🔊 미리듣기</span>
+                  </button>
+                </div>
+                <select
+                  value={femaleVoiceURI}
+                  onChange={(e) => {
+                    const uri = e.target.value;
+                    setFemaleVoiceURI(uri);
+                    femaleVoiceURIRef.current = uri;
+                    const found = voicesRef.current.find((v) => v.voiceURI === uri);
+                    if (found && isPlaying) {
+                      setShowSaveSuccessToast(`👩 여성 음성이 ${found.name}(으)로 변경되었습니다. 다음 재생부터 적용됩니다.`);
+                      setTimeout(() => setShowSaveSuccessToast(null), 2200);
+                    }
+                  }}
+                  className="w-full text-xs py-2 px-2.5 rounded-lg border border-slate-200 bg-white text-slate-800 focus:outline-none focus:ring-2 focus:ring-rose-500/20 focus:border-rose-500 cursor-pointer truncate min-h-[44px]"
                 >
-                  <Volume2 className="w-3.5 h-3.5" />
-                  <span>🔊 미리듣기</span>
-                </button>
+                  {voices.map((v) => (
+                    <option key={v.voiceURI} value={v.voiceURI}>
+                      {detectVoiceGender(v) === 'female' ? '👩 [여성추천] ' : '🗣 '}
+                      {v.name} ({formatVoiceLang(v.lang)})
+                    </option>
+                  ))}
+                </select>
               </div>
-              <select
-                value={maleVoiceURI}
-                onChange={(e) => setMaleVoiceURI(e.target.value)}
-                className="w-full text-xs py-2 px-2.5 rounded-lg border border-slate-200 bg-white text-slate-800 focus:outline-none focus:ring-2 focus:ring-sky-500/20 focus:border-sky-500 cursor-pointer truncate min-h-[44px]"
-              >
-                {voices.map((v) => (
-                  <option key={v.voiceURI} value={v.voiceURI}>
-                    {detectVoiceGender(v) === 'male' ? '👨 [남성추천] ' : '🗣 '}
-                    {v.name} ({v.lang})
-                  </option>
-                ))}
-              </select>
+
+              {/* 남성 음성 */}
+              <div className="flex flex-col gap-1.5 bg-sky-50/40 p-3 rounded-xl border border-sky-100">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-semibold text-sky-800 flex items-center gap-1.5">
+                    <span>👨 지정 남성 음성</span>
+                    <span className="text-slate-400 font-normal text-[11px]">· 0.65x 딥 바리톤</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => handleTestVoice('male')}
+                    className="px-2.5 py-1 rounded-lg bg-sky-100 hover:bg-sky-200 text-sky-800 text-[11px] font-bold border border-sky-300/80 transition-colors flex items-center gap-1 cursor-pointer active:scale-95 shadow-2xs"
+                    title="남성 음성 샘플 미리듣기 (0.65x 저음 자동 보정)"
+                  >
+                    <Volume2 className="w-3.5 h-3.5" />
+                    <span>🔊 미리듣기</span>
+                  </button>
+                </div>
+                <select
+                  value={maleVoiceURI}
+                  onChange={(e) => {
+                    const uri = e.target.value;
+                    setMaleVoiceURI(uri);
+                    maleVoiceURIRef.current = uri;
+                    const found = voicesRef.current.find((v) => v.voiceURI === uri);
+                    if (found && isPlaying) {
+                      setShowSaveSuccessToast(`👨 남성 음성이 ${found.name}(으)로 변경되었습니다. 다음 재생부터 적용됩니다.`);
+                      setTimeout(() => setShowSaveSuccessToast(null), 2200);
+                    }
+                  }}
+                  className="w-full text-xs py-2 px-2.5 rounded-lg border border-slate-200 bg-white text-slate-800 focus:outline-none focus:ring-2 focus:ring-sky-500/20 focus:border-sky-500 cursor-pointer truncate min-h-[44px]"
+                >
+                  {voices.map((v) => (
+                    <option key={v.voiceURI} value={v.voiceURI}>
+                      {detectVoiceGender(v) === 'male' ? '👨 [남성추천] ' : '🗣 '}
+                      {v.name} ({formatVoiceLang(v.lang)})
+                    </option>
+                  ))}
+                </select>
+              </div>
             </div>
           </div>
 
@@ -2203,7 +2518,13 @@ export default function App() {
                           <span>{log.totalCycles}회차 완료</span>
                           <span>·</span>
                           <span>
-                            {log.voiceMode === 'alternate' ? '남녀교차' : log.voiceMode === 'female-only' ? '여성만' : '남성만'}
+                            {log.voiceMode === 'alternate'
+                              ? '남녀교차'
+                              : log.voiceMode === 'custom'
+                                ? '직접선택'
+                                : log.voiceMode === 'female-only'
+                                  ? '여성만'
+                                  : '남성만'}
                           </span>
                         </div>
 

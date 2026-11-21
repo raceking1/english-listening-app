@@ -14,7 +14,7 @@ export interface StudySessionLog {
   totalCycles: number;
   totalSentencesSpoken: number;
   durationSeconds: number;
-  voiceMode: 'alternate' | 'female-only' | 'male-only';
+  voiceMode: 'alternate' | 'custom' | 'female-only' | 'male-only';
   playbackRate: number;
 }
 

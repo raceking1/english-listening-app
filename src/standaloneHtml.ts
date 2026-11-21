@@ -18,6 +18,7 @@ export function generateStandaloneHtml(
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="referrer" content="no-referrer" />
   <title>영어 문장 반복 청취 & 대형 자막 (날짜별 저장 & 화면꺼짐 재생)</title>
   <style>
     /* =========================================================
@@ -469,6 +470,11 @@ export function generateStandaloneHtml(
         🔁 전체 반복: <span id="loopStatusText">${initialFullLoop ? 'ON' : 'OFF'}</span>
       </button>
 
+      <!-- 표준 HTML <audio> 화면꺼짐·앱전환 연속 재생 전환 버튼 -->
+      <button id="btnEngineToggle" class="btn-secondary toggle-active" style="flex: 1.6; min-width: 150px;" title="표준 HTML <audio> 백그라운드 연속 재생과 기기 내장 음성을 전환합니다">
+        🎵 <span id="engineToggleText">HTML 오디오(화면꺼짐 지원)</span>
+      </button>
+
       <!-- 🌙 주머니 절전 모드 -->
       <button id="btnPocketModeToggle" class="btn-secondary" style="flex: 1.5; min-width: 140px; background:#0f172a; color:#818cf8; border-color:#334155;" title="화면을 완전 블랙으로 전환하고 터치를 잠급니다 (OLED 배터리 0% 소모)">
         🌙 주머니 절전 모드
@@ -636,10 +642,14 @@ export function generateStandaloneHtml(
     </div>
   </div>
 
+  <!-- 표준 HTML <audio> 태그 (Web Audio API 미사용 · 화면 꺼짐 및 백그라운드 앱 전환 시 연속 재생) -->
+  <audio id="speechAudio" playsinline preload="auto" style="display:none;"></audio>
+  <audio id="bgKeepAliveAudio" loop playsinline preload="auto" style="display:none;"></audio>
+
   <!-- =========================================================
-       [핵심 스크립트] 
-       1. 남/녀 교차 음성
-       2. 화면꺼짐 백그라운드 오디오 세션 & MediaSession
+       [핵심 스크립트]
+       1. 표준 HTML <audio> 태그 기반 화면꺼짐·백그라운드 앱전환 연속 재생
+       2. navigator.mediaSession API 잠금 화면 재생/일시정지/이전/다음 제어
        3. 날짜별 공부 내용 로컬스토리지 저장 및 불러오기
        ========================================================= -->
   <script>
@@ -657,9 +667,14 @@ export function generateStandaloneHtml(
     let currentUtterance = null;
     let rate = ${rate};
 
-    // 화면 꺼짐 백그라운드 재생 세션
+    let audioEngine = 'mp3'; // 기본값: 표준 HTML <audio> (화면 꺼짐/다른 앱 전환 연속 재생)
+    let playbackToken = 0;
+    let isResting = false;
+
+    // 화면 꺼짐 백그라운드 재생 세션 (표준 HTML <audio> DOM 요소 사용)
     let isBgAudioEnabled = true;
-    let bgAudioElement = null;
+    const speechAudio = document.getElementById('speechAudio');
+    const bgAudioElement = document.getElementById('bgKeepAliveAudio');
 
     // 학습 시간 측정 타이머
     let sessionStartTime = null;
@@ -684,6 +699,8 @@ export function generateStandaloneHtml(
     const voiceCountBadge = document.getElementById('voiceCountBadge');
     const btnPreviewVoice = document.getElementById('btnPreviewVoice');
     const btnRefreshVoices = document.getElementById('btnRefreshVoices');
+    const btnEngineToggle = document.getElementById('btnEngineToggle');
+    const engineToggleText = document.getElementById('engineToggleText');
 
     const btnStart = document.getElementById('btnStart');
     const btnPause = document.getElementById('btnPause');
@@ -729,23 +746,21 @@ export function generateStandaloneHtml(
 
     // =========================================================
     // [화면 꺼짐 백그라운드 재생 세션 초기화]
-    // 모바일 OS가 슬립/화면꺼짐 상태에서도 오디오 및 JS 타이머를 유지하도록
-    // 1초 무음 WAV를 배경에서 연속 루프 재생합니다.
+    // Web Audio API 대신 표준 HTML <audio> 태그를 사용하여 백그라운드에서도
+    // 오디오 세션과 JS 타이머가 유지되도록 합니다.
     // =========================================================
     const SILENT_WAV_BASE64 = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAP8A/wD/';
 
     function initBackgroundAudio() {
-      if (!bgAudioElement) {
-        bgAudioElement = new Audio(SILENT_WAV_BASE64);
+      if (bgAudioElement) {
+        if (!bgAudioElement.src) bgAudioElement.src = SILENT_WAV_BASE64;
         bgAudioElement.loop = true;
         bgAudioElement.volume = 0.01;
-        bgAudioElement.setAttribute('playsinline', 'true');
-        bgAudioElement.setAttribute('webkit-playsinline', 'true');
       }
     }
 
     async function startBgAudioSession() {
-      if (!isBgAudioEnabled) return;
+      if (!isBgAudioEnabled || !bgAudioElement) return;
       try {
         initBackgroundAudio();
         if (bgAudioElement.paused) {
@@ -756,30 +771,82 @@ export function generateStandaloneHtml(
       }
     }
 
+    function pauseBgAudioSession() {
+      if (bgAudioElement && !bgAudioElement.paused) {
+        bgAudioElement.pause();
+      }
+    }
+
     function stopBgAudioSession() {
       if (bgAudioElement) {
         bgAudioElement.pause();
-        bgAudioElement.currentTime = 0;
+        try { bgAudioElement.currentTime = 0; } catch (e) {}
       }
+    }
+
+    function splitTextForAudioTts(txt, maxLen) {
+      const cleaned = (txt || '').trim().replace(/\\s+/g, ' ');
+      if (!cleaned) return [];
+      if (cleaned.length <= maxLen) return [cleaned];
+      const words = cleaned.split(' ');
+      const chunks = [];
+      let current = '';
+      words.forEach(w => {
+        if (w.length > maxLen) {
+          if (current) { chunks.push(current); current = ''; }
+          for (let i = 0; i < w.length; i += maxLen) chunks.push(w.slice(i, i + maxLen));
+          return;
+        }
+        const cand = current ? current + ' ' + w : w;
+        if (cand.length <= maxLen) current = cand;
+        else { if (current) chunks.push(current); current = w; }
+      });
+      if (current) chunks.push(current);
+      return chunks;
+    }
+
+    function buildAudioTtsUrl(chunk, lang, tier) {
+      const encoded = encodeURIComponent(chunk);
+      const normLang = (lang || 'en-US').replace('_', '-');
+      if (tier === 0) return 'https://translate.google.com/translate_tts?ie=UTF-8&tl=' + encodeURIComponent(normLang) + '&client=tw-ob&q=' + encoded;
+      if (tier === 1) return 'https://translate.googleapis.com/translate_tts?ie=UTF-8&tl=' + encodeURIComponent(normLang) + '&client=gtx&q=' + encoded;
+      return 'https://dict.youdao.com/dictvoice?audio=' + encoded + '&type=2';
+    }
+
+    function setMediaPlaybackState(state) {
+      if ('mediaSession' in navigator) {
+        try { navigator.mediaSession.playbackState = state; } catch (e) {}
+      }
+    }
+
+    function safeActionHandler(action, fn) {
+      try { navigator.mediaSession.setActionHandler(action, fn); } catch (e) {}
     }
 
     // 잠금 화면 컨트롤 (MediaSession API)
     function updateMediaSession(text, sentenceIdx, totalSentences, repeat, totalRepeats) {
       if ('mediaSession' in navigator) {
         try {
-          const activeVoiceLabel = voiceMode === 'custom'
-            ? ('🗣️ ' + ((englishVoices.find(v => v.voiceURI === selectedVoiceURI) || {}).name || '선택한 영어 음성'))
-            : (currentGender === 'female' ? '👩 여성 음성' : '👨 남성 음성');
+          const activeVoiceLabel = audioEngine === 'mp3'
+            ? '🎵 HTML 오디오 (화면꺼짐 지원)'
+            : voiceMode === 'custom'
+              ? ('🗣️ ' + ((englishVoices.find(v => v.voiceURI === selectedVoiceURI) || {}).name || '선택한 영어 음성'))
+              : (currentGender === 'female' ? '👩 여성 음성' : '👨 남성 음성');
           navigator.mediaSession.metadata = new MediaMetadata({
             title: text || '영어 문장 반복 청취',
             artist: activeVoiceLabel + ' · RepeatEcho',
             album: \`문장 \${sentenceIdx + 1}/\${totalSentences} · 반복 \${repeat}/\${totalRepeats} · 전체 \${loopCycle}회차\`
           });
 
-          navigator.mediaSession.setActionHandler('play', () => { btnResume.click(); });
-          navigator.mediaSession.setActionHandler('pause', () => { btnPause.click(); });
-          navigator.mediaSession.setActionHandler('previoustrack', () => { btnPrev.click(); });
-          navigator.mediaSession.setActionHandler('nexttrack', () => { btnNext.click(); });
+          setMediaPlaybackState('playing');
+          safeActionHandler('play', () => {
+            if (!isPlaying) btnStart.click();
+            else if (isPaused) btnResume.click();
+          });
+          safeActionHandler('pause', () => { if (isPlaying && !isPaused) btnPause.click(); });
+          safeActionHandler('stop', () => { btnStop.click(); });
+          safeActionHandler('previoustrack', () => { if (currentSentenceIdx > 0) jumpToSentence(currentSentenceIdx - 1); });
+          safeActionHandler('nexttrack', () => { if (currentSentenceIdx < sentences.length - 1) jumpToSentence(currentSentenceIdx + 1); });
         } catch (e) {
           console.warn('MediaSession error:', e);
         }
@@ -1191,14 +1258,54 @@ export function generateStandaloneHtml(
 
     function jumpToSentence(idx) {
       if (idx < 0 || idx >= sentences.length) return;
-      stopSpeech();
+      stopSpeech(true);
       currentSentenceIdx = idx;
       currentRepeatCount = 1;
       currentGender = 'female';
       isPlaying = true;
       isPaused = false;
+      startBgAudioSession();
       updateButtons();
       speakCurrent();
+    }
+
+    function advanceAfterSentence(targetRepeat, expectedToken) {
+      if (playbackToken !== expectedToken || !isPlaying || isPaused) return;
+
+      if (voiceMode === 'alternate') {
+        currentGender = currentGender === 'female' ? 'male' : 'female';
+      }
+
+      if (currentRepeatCount < targetRepeat) {
+        currentRepeatCount++;
+        pauseTimeoutId = setTimeout(() => {
+          if (playbackToken !== expectedToken || !isPlaying || isPaused) return;
+          speakCurrent();
+        }, 300);
+        return;
+      }
+
+      currentRepeatCount = 1;
+      currentSentenceIdx++;
+
+      if (currentSentenceIdx < sentences.length) {
+        const pauseSec = parseFloat(inputPause.value) || 0;
+        if (pauseSec > 0) {
+          isResting = true;
+          pauseIndicator.textContent = \`다음 문장까지 \${pauseSec}초 휴식 중...\`;
+          pauseIndicator.style.display = 'block';
+          pauseTimeoutId = setTimeout(() => {
+            if (playbackToken !== expectedToken || !isPlaying || isPaused) return;
+            isResting = false;
+            pauseIndicator.style.display = 'none';
+            speakCurrent();
+          }, pauseSec * 1000);
+        } else {
+          speakCurrent();
+        }
+      } else {
+        speakCurrent();
+      }
     }
 
     // 핵심 낭독 함수
@@ -1210,9 +1317,13 @@ export function generateStandaloneHtml(
           loopCycle++;
           currentSentenceIdx = 0;
           currentRepeatCount = 1;
+          isResting = true;
           pauseIndicator.textContent = \`🔁 전체 \${loopCycle}회차 반복을 시작합니다...\`;
           pauseIndicator.style.display = 'block';
+          const token = playbackToken;
           pauseTimeoutId = setTimeout(() => {
+            if (playbackToken !== token || !isPlaying || isPaused) return;
+            isResting = false;
             speakCurrent();
           }, 800);
           return;
@@ -1221,6 +1332,10 @@ export function generateStandaloneHtml(
           return;
         }
       }
+
+      stopSpeech(true);
+      const token = playbackToken;
+      isResting = false;
 
       // 화면꺼짐 백그라운드 오디오 루프 유지 & Wake Lock 화면꺼짐 방지
       startBgAudioSession();
@@ -1243,7 +1358,10 @@ export function generateStandaloneHtml(
       labelLoop.textContent = isFullLoop ? '전체반복: ON (' + loopCycle + '회차)' : '전체반복: OFF';
       labelSpeed.textContent = rate.toFixed(1) + 'x';
 
-      if (voiceMode === 'custom') {
+      if (audioEngine === 'mp3') {
+        genderBadge.textContent = '🎵 HTML <audio> (화면꺼짐 지원)';
+        genderBadge.className = 'gender-badge gender-female';
+      } else if (voiceMode === 'custom') {
         const customVoice = englishVoices.find(v => v.voiceURI === selectedVoiceURI) || englishVoices[0];
         genderBadge.textContent = '🗣️ ' + (customVoice ? customVoice.name : '선택한 영어 음성');
         genderBadge.className = 'gender-badge gender-female';
@@ -1261,6 +1379,59 @@ export function generateStandaloneHtml(
       // 잠금 화면 / 블루투스 컨트롤 메타데이터 업데이트
       updateMediaSession(text, currentSentenceIdx, sentences.length, currentRepeatCount, targetRepeat);
 
+      if (audioEngine === 'mp3' && speechAudio) {
+        const chunks = splitTextForAudioTts(text, 180);
+        if (chunks.length === 0) {
+          advanceAfterSentence(targetRepeat, token);
+          return;
+        }
+        const customVoice = voiceMode === 'custom'
+          ? (englishVoices.find(v => v.voiceURI === selectedVoiceURI) || englishVoices[0])
+          : null;
+        const preferredLang = customVoice ? formatVoiceLang(customVoice.lang) : 'en-US';
+
+        const playChunk = (chunkIdx, tier) => {
+          if (playbackToken !== token || !isPlaying || isPaused) return;
+          speechAudio.pause();
+          speechAudio.src = buildAudioTtsUrl(chunks[chunkIdx], preferredLang, tier);
+          speechAudio.preservesPitch = true;
+          speechAudio.playbackRate = Math.max(0.5, Math.min(2.0, rate));
+
+          speechAudio.onended = function() {
+            if (playbackToken !== token || !isPlaying || isPaused) return;
+            if (chunkIdx + 1 < chunks.length) {
+              playChunk(chunkIdx + 1, 0);
+            } else {
+              advanceAfterSentence(targetRepeat, token);
+            }
+          };
+
+          speechAudio.onerror = function() {
+            if (playbackToken !== token || !isPlaying || isPaused) return;
+            if (tier < 2) {
+              playChunk(chunkIdx, tier + 1);
+            } else {
+              speakViaWebSpeech(text, activeGender, targetRepeat, token);
+            }
+          };
+
+          speechAudio.play().catch(function(err) {
+            if (playbackToken !== token) return;
+            if (err && err.name === 'AbortError') return;
+            if (tier < 2) playChunk(chunkIdx, tier + 1);
+            else speakViaWebSpeech(text, activeGender, targetRepeat, token);
+          });
+        };
+
+        playChunk(0, 0);
+        return;
+      }
+
+      speakViaWebSpeech(text, activeGender, targetRepeat, token);
+    }
+
+    function speakViaWebSpeech(text, activeGender, targetRepeat, expectedToken) {
+      if (!('speechSynthesis' in window)) return;
       currentUtterance = new SpeechSynthesisUtterance(text);
 
       // 음성 먼저 할당 (속도 리셋 버그 방지)
@@ -1286,34 +1457,7 @@ export function generateStandaloneHtml(
       currentUtterance.pitch = customVoice ? 1.0 : (activeGender === 'female' ? 1.22 : 0.65);
 
       currentUtterance.onend = function() {
-        if (!isPlaying || isPaused) return;
-
-        // 남/녀 교차
-        if (voiceMode === 'alternate') {
-          currentGender = currentGender === 'female' ? 'male' : 'female';
-        }
-
-        if (currentRepeatCount < targetRepeat) {
-          currentRepeatCount++;
-          pauseTimeoutId = setTimeout(speakCurrent, 300);
-        } else {
-          currentRepeatCount = 1;
-          currentSentenceIdx++;
-
-          if (currentSentenceIdx < sentences.length) {
-            const pauseSec = parseFloat(inputPause.value) || 0;
-            if (pauseSec > 0) {
-              pauseIndicator.textContent = \`다음 문장까지 \${pauseSec}초 휴식 중...\`;
-              pauseIndicator.style.display = 'block';
-            }
-            pauseTimeoutId = setTimeout(() => {
-              pauseIndicator.style.display = 'none';
-              speakCurrent();
-            }, pauseSec * 1000);
-          } else {
-            speakCurrent();
-          }
-        }
+        advanceAfterSentence(targetRepeat, expectedToken);
       };
 
       currentUtterance.onerror = function(e) {
@@ -1337,7 +1481,9 @@ export function generateStandaloneHtml(
       });
     }
 
-    function stopSpeech() {
+    function stopSpeech(keepBgSession) {
+      playbackToken++;
+      isResting = false;
       if (pauseTimeoutId) {
         clearTimeout(pauseTimeoutId);
         pauseTimeoutId = null;
@@ -1345,18 +1491,26 @@ export function generateStandaloneHtml(
       if ('speechSynthesis' in window) {
         window.speechSynthesis.cancel();
       }
-      stopBgAudioSession();
-      releaseWakeLock();
+      if (speechAudio) {
+        speechAudio.onended = null;
+        speechAudio.onerror = null;
+        speechAudio.pause();
+        try { speechAudio.currentTime = 0; } catch (e) {}
+      }
+      if (!keepBgSession) {
+        stopBgAudioSession();
+        releaseWakeLock();
+      }
     }
 
     function finishStudy() {
-      stopSpeech();
-      releaseWakeLock();
+      stopSpeech(false);
       isPlaying = false;
       isPaused = false;
       subtitleText.textContent = '🎉 모든 문장 청취 완료!';
       subtitleText.classList.remove('waiting');
       pauseIndicator.style.display = 'none';
+      setMediaPlaybackState('none');
       updateButtons();
 
       // 세션 자동 저장 (10초 이상 공부했을 시)
@@ -1482,6 +1636,23 @@ export function generateStandaloneHtml(
       if (!isPlaying) renderSentenceList();
     });
 
+    if (btnEngineToggle) {
+      btnEngineToggle.addEventListener('click', () => {
+        audioEngine = audioEngine === 'mp3' ? 'webspeech' : 'mp3';
+        if (audioEngine === 'mp3') {
+          btnEngineToggle.classList.add('toggle-active');
+          if (engineToggleText) engineToggleText.textContent = 'HTML 오디오(화면꺼짐 지원)';
+        } else {
+          btnEngineToggle.classList.remove('toggle-active');
+          if (engineToggleText) engineToggleText.textContent = '기기 음성(남녀교차)';
+        }
+        if (isPlaying && !isPaused) {
+          stopSpeech(true);
+          speakCurrent();
+        }
+      });
+    }
+
     inputRepeat.addEventListener('input', (e) => { valRepeat.textContent = e.target.value + '회'; });
     inputPause.addEventListener('input', (e) => { valPause.textContent = e.target.value + '초'; });
     inputRate.addEventListener('input', (e) => {
@@ -1490,9 +1661,13 @@ export function generateStandaloneHtml(
       valRate.textContent = rate.toFixed(1) + 'x';
       labelSpeed.textContent = rate.toFixed(1) + 'x';
 
-      if (isPlaying && !isPaused) {
-        stopSpeech();
-        speakCurrent();
+      if (isPlaying && !isPaused && !isResting) {
+        if (audioEngine === 'mp3' && speechAudio && !speechAudio.paused) {
+          speechAudio.playbackRate = rate;
+        } else {
+          stopSpeech(true);
+          speakCurrent();
+        }
       }
     });
 
@@ -1500,7 +1675,7 @@ export function generateStandaloneHtml(
       sentences = parseSentences(textInput.value);
       if (sentences.length === 0) return alert('문장을 입력해 주세요!');
       renderSentenceList();
-      stopSpeech();
+      stopSpeech(true);
       currentSentenceIdx = 0;
       currentRepeatCount = 1;
       currentGender = 'female';
@@ -1517,16 +1692,24 @@ export function generateStandaloneHtml(
         }
       }, 1000);
 
+      startBgAudioSession();
       updateButtons();
       speakCurrent();
     });
 
     btnPause.addEventListener('click', () => {
       if (!isPlaying || isPaused) return;
+      playbackToken++;
       isPaused = true;
       if (pauseTimeoutId) clearTimeout(pauseTimeoutId);
-      window.speechSynthesis.pause();
-      stopBgAudioSession();
+      if (audioEngine === 'mp3' && speechAudio) {
+        speechAudio.pause();
+      }
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.pause();
+      }
+      pauseBgAudioSession();
+      setMediaPlaybackState('paused');
       updateButtons();
     });
 
@@ -1534,13 +1717,24 @@ export function generateStandaloneHtml(
       if (!isPlaying || !isPaused) return;
       isPaused = false;
       startBgAudioSession();
-      window.speechSynthesis.resume();
+      setMediaPlaybackState('playing');
       updateButtons();
-      if (!window.speechSynthesis.speaking) speakCurrent();
+      if (audioEngine === 'mp3' && speechAudio) {
+        if (!isResting && speechAudio.src && speechAudio.paused && !speechAudio.ended && speechAudio.currentTime > 0) {
+          speechAudio.play().catch(() => speakCurrent());
+        } else {
+          speakCurrent();
+        }
+        return;
+      }
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.resume();
+        if (!window.speechSynthesis.speaking) speakCurrent();
+      }
     });
 
     btnStop.addEventListener('click', () => {
-      stopSpeech();
+      stopSpeech(false);
       isPlaying = false;
       isPaused = false;
       if (sessionTimerInterval) clearInterval(sessionTimerInterval);
@@ -1551,6 +1745,7 @@ export function generateStandaloneHtml(
       subtitleText.textContent = "'학습 시작'을 누르면 여자/남자 음성이 번갈아가며 재생됩니다.";
       subtitleText.classList.add('waiting');
       labelSentence.textContent = '문장: 0 / ' + sentences.length;
+      setMediaPlaybackState('none');
       updateButtons();
     });
 

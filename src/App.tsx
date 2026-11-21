@@ -66,9 +66,14 @@ import {
   formatKoreanDate
 } from './studyStorage';
 import {
+  SILENT_WAV_BASE64,
+  attachBackgroundAudioElement,
   startBackgroundAudio,
   pauseBackgroundAudio,
   stopBackgroundAudio,
+  splitTextForAudioTts,
+  buildAudioTtsUrl,
+  setMediaSessionPlaybackState,
   updateMediaSessionState
 } from './backgroundAudio';
 
@@ -93,13 +98,14 @@ export default function App() {
   const [isFullLoop, setIsFullLoop] = useState<boolean>(true);
   const [loopCycle, setLoopCycle] = useState<number>(1);
 
-  // [기능 3] 오디오 재생 엔진 및 스마트폰 화면꺼짐 / 주머니 절전 모드
-  const [audioEngine, setAudioEngine] = useState<'webspeech' | 'mp3'>('webspeech');
+  // [기능 3] 표준 HTML <audio> 재생 엔진 (기본값: 화면꺼짐·앱전환 연속 재생) & 주머니 절전 모드
+  const [audioEngine, setAudioEngine] = useState<'webspeech' | 'mp3'>('mp3');
   const [isPocketMode, setIsPocketMode] = useState<boolean>(false);
   const [showScreenOffGuideModal, setShowScreenOffGuideModal] = useState<boolean>(false);
   const [pocketHoldProgress, setPocketHoldProgress] = useState<number>(0);
   const pocketHoldIntervalRef = useRef<number | null>(null);
   const htmlAudioRef = useRef<HTMLAudioElement | null>(null);
+  const bgKeepAliveAudioRef = useRef<HTMLAudioElement | null>(null);
   const [isBgAudioMode, setIsBgAudioMode] = useState<boolean>(true);
 
   // [기능 4] 날짜별 학습 기록 저장 & 복습 (Daily Study History)
@@ -150,6 +156,31 @@ export default function App() {
   const repeatCountRef = useRef<number>(3);
   const pauseSecondsRef = useRef<number>(1.0);
   const isFullLoopRef = useRef<boolean>(true);
+  const sentencesRef = useRef<string[]>([]);
+  const isPlayingRef = useRef<boolean>(false);
+  const isPausedRef = useRef<boolean>(false);
+  const isRestingRef = useRef<boolean>(false);
+  const currentSentenceIdxRef = useRef<number>(0);
+  const currentRepeatRef = useRef<number>(1);
+  const currentGenderRef = useRef<'female' | 'male'>('female');
+  const audioEngineRef = useRef<'webspeech' | 'mp3'>('mp3');
+  const isBgAudioModeRef = useRef<boolean>(true);
+  const loopCycleRef = useRef<number>(1);
+  const sessionSecondsRef = useRef<number>(0);
+  const playbackTokenRef = useRef<number>(0);
+  const mediaHandlersRef = useRef<{
+    onPlay: () => void;
+    onPause: () => void;
+    onStop: () => void;
+    onPrevious: () => void;
+    onNext: () => void;
+  }>({
+    onPlay: () => {},
+    onPause: () => {},
+    onStop: () => {},
+    onPrevious: () => {},
+    onNext: () => {},
+  });
   const pauseTimerRef = useRef<number | null>(null);
   const countdownIntervalRef = useRef<number | null>(null);
   const activeUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
@@ -184,9 +215,24 @@ export default function App() {
   useEffect(() => {
     isFullLoopRef.current = isFullLoop;
   }, [isFullLoop]);
-
-  // Load study logs on mount
   useEffect(() => {
+    audioEngineRef.current = audioEngine;
+  }, [audioEngine]);
+  useEffect(() => {
+    isBgAudioModeRef.current = isBgAudioMode;
+  }, [isBgAudioMode]);
+  useEffect(() => {
+    loopCycleRef.current = loopCycle;
+  }, [loopCycle]);
+  useEffect(() => {
+    sessionSecondsRef.current = sessionSeconds;
+  }, [sessionSeconds]);
+
+  // Mount: bind keep-alive HTML <audio> element and load study logs
+  useEffect(() => {
+    if (bgKeepAliveAudioRef.current) {
+      attachBackgroundAudioElement(bgKeepAliveAudioRef.current);
+    }
     setStudyLogs(loadStudyLogs());
   }, []);
 
@@ -225,6 +271,10 @@ export default function App() {
       .map((s) => s.trim())
       .filter((s) => s.length > 0);
   }, [inputText, splitMode]);
+
+  useEffect(() => {
+    sentencesRef.current = sentences;
+  }, [sentences]);
 
   // ==========================================
   // 3. 브라우저 Web Speech API 영어 음성 안정적 로드 (PC + 모바일 대응)
@@ -379,11 +429,14 @@ export default function App() {
 
   // 백그라운드 전환 후 복귀 시 자동 Wake Lock 갱신 및 재생 복원
   useEffect(() => {
-    const handleVisibilityChange = async () => {
+    const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
-        if (isPlaying && !isPaused) {
+        if (isPlayingRef.current && !isPausedRef.current) {
           requestWakeLockAuto();
-          if (audioEngine === 'webspeech' && typeof window !== 'undefined' && 'speechSynthesis' in window) {
+          if (isBgAudioModeRef.current) {
+            startBackgroundAudio();
+          }
+          if (audioEngineRef.current === 'webspeech' && typeof window !== 'undefined' && 'speechSynthesis' in window) {
             if (window.speechSynthesis.paused) {
               window.speechSynthesis.resume();
             }
@@ -395,7 +448,16 @@ export default function App() {
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, []);
+
+  // Unmount cleanup
+  useEffect(() => {
+    return () => {
+      playbackTokenRef.current += 1;
       if (pocketHoldIntervalRef.current) clearInterval(pocketHoldIntervalRef.current);
+      if (pauseTimerRef.current) clearTimeout(pauseTimerRef.current);
+      if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
       if (wakeLockSentinelRef.current) {
         wakeLockSentinelRef.current.release().catch(() => {});
       }
@@ -403,8 +465,9 @@ export default function App() {
       if (htmlAudioRef.current) {
         htmlAudioRef.current.pause();
       }
+      setMediaSessionPlaybackState('none');
     };
-  }, [isPlaying, isPaused, audioEngine]);
+  }, []);
 
   // ==========================================
   // 5. 날짜별 학습 내용 저장 핸들러
@@ -464,59 +527,172 @@ export default function App() {
     }
   };
 
-  const stopAllSpeech = () => {
+  const stopAllSpeech = (keepBackgroundSession = false) => {
+    playbackTokenRef.current += 1;
     clearAllTimers();
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       window.speechSynthesis.cancel();
     }
     if (htmlAudioRef.current) {
-      htmlAudioRef.current.pause();
-      htmlAudioRef.current.currentTime = 0;
       htmlAudioRef.current.onended = null;
       htmlAudioRef.current.onerror = null;
+      htmlAudioRef.current.pause();
+      try {
+        htmlAudioRef.current.currentTime = 0;
+      } catch {
+        // ignore if metadata not loaded
+      }
     }
     activeUtteranceRef.current = null;
+    isRestingRef.current = false;
     setIsResting(false);
     setActiveWordCharRange(null);
-    stopBackgroundAudio();
+    if (!keepBackgroundSession) {
+      stopBackgroundAudio();
+    }
+  };
+
+  // 문장 완료 후 반복/다음 문장/전체반복 전환 공통 처리
+  const advanceAfterSentenceSpoken = (
+    sentenceIndex: number,
+    repeatNum: number,
+    targetGender: 'female' | 'male',
+    expectedToken: number
+  ) => {
+    if (playbackTokenRef.current !== expectedToken || !isPlayingRef.current || isPausedRef.current) {
+      return;
+    }
+
+    const activeList = sentencesRef.current;
+    const latestMode = voiceModeRef.current;
+    const nextGender: 'female' | 'male' =
+      latestMode === 'alternate' ? (targetGender === 'female' ? 'male' : 'female') : targetGender;
+
+    if (repeatNum < repeatCountRef.current) {
+      pauseTimerRef.current = window.setTimeout(() => {
+        if (playbackTokenRef.current !== expectedToken || !isPlayingRef.current || isPausedRef.current) return;
+        speakSentence(sentenceIndex, repeatNum + 1, nextGender);
+      }, 300);
+      return;
+    }
+
+    const nextIdx = sentenceIndex + 1;
+    if (nextIdx < activeList.length) {
+      const pSec = pauseSecondsRef.current;
+      if (pSec > 0) {
+        isRestingRef.current = true;
+        setIsResting(true);
+        setRestCountdown(pSec);
+
+        const startTime = Date.now();
+        const totalDuration = pSec * 1000;
+
+        countdownIntervalRef.current = window.setInterval(() => {
+          const elapsed = Date.now() - startTime;
+          const remaining = Math.max(0, (totalDuration - elapsed) / 1000);
+          setRestCountdown(parseFloat(remaining.toFixed(1)));
+
+          if (remaining <= 0 && countdownIntervalRef.current) {
+            clearInterval(countdownIntervalRef.current);
+            countdownIntervalRef.current = null;
+          }
+        }, 100);
+
+        pauseTimerRef.current = window.setTimeout(() => {
+          if (playbackTokenRef.current !== expectedToken || !isPlayingRef.current || isPausedRef.current) return;
+          isRestingRef.current = false;
+          setIsResting(false);
+          speakSentence(nextIdx, 1, nextGender);
+        }, totalDuration);
+      } else {
+        speakSentence(nextIdx, 1, nextGender);
+      }
+      return;
+    }
+
+    // 마지막 문장 종료 -> 전체 반복 여부 판별
+    if (isFullLoopRef.current && activeList.length > 0) {
+      loopCycleRef.current += 1;
+      setLoopCycle(loopCycleRef.current);
+      isRestingRef.current = true;
+      setIsResting(true);
+      setRestCountdown(1.0);
+      pauseTimerRef.current = window.setTimeout(() => {
+        if (playbackTokenRef.current !== expectedToken || !isPlayingRef.current || isPausedRef.current) return;
+        isRestingRef.current = false;
+        setIsResting(false);
+        speakSentence(0, 1, nextGender);
+      }, 1000);
+    } else {
+      if (sessionSecondsRef.current >= 15) {
+        handleSaveCurrentSession();
+      }
+      isPlayingRef.current = false;
+      isPausedRef.current = false;
+      isRestingRef.current = false;
+      setIsPlaying(false);
+      setIsPaused(false);
+      setIsResting(false);
+      stopBackgroundAudio();
+      releaseWakeLockAuto();
+      setMediaSessionPlaybackState('none');
+    }
   };
 
   // 문장 낭독 실행 함수
   const speakSentence = (sentenceIndex: number, repeatNum: number, targetGender: 'female' | 'male') => {
+    const activeList = sentencesRef.current;
+
     // 모든 문장 끝에 도달했을 때
-    if (sentenceIndex >= sentences.length) {
-      if (isFullLoop && sentences.length > 0) {
-        setLoopCycle((prev) => prev + 1);
+    if (sentenceIndex >= activeList.length) {
+      if (isFullLoopRef.current && activeList.length > 0) {
+        loopCycleRef.current += 1;
+        setLoopCycle(loopCycleRef.current);
+        isRestingRef.current = true;
         setIsResting(true);
         setRestCountdown(1.0);
+        const token = playbackTokenRef.current;
         pauseTimerRef.current = window.setTimeout(() => {
+          if (playbackTokenRef.current !== token || !isPlayingRef.current || isPausedRef.current) return;
+          isRestingRef.current = false;
           setIsResting(false);
           speakSentence(0, 1, 'female');
         }, 800);
         return;
       } else {
-        // 학습 종료 시 자동 저장 (15초 이상 학습했을 경우)
-        if (sessionSeconds >= 15) {
+        if (sessionSecondsRef.current >= 15) {
           handleSaveCurrentSession();
         }
+        isPlayingRef.current = false;
+        isPausedRef.current = false;
+        isRestingRef.current = false;
         setIsPlaying(false);
         setIsPaused(false);
         setIsResting(false);
         stopBackgroundAudio();
         releaseWakeLockAuto();
+        setMediaSessionPlaybackState('none');
         return;
       }
     }
 
-    // 재생 시작 시 스마트폰 화면 꺼짐 방지(Wake Lock) 자동 요청
+    // 재생 시작 시 스마트폰 화면 꺼짐 방지(Wake Lock) 및 표준 HTML <audio> 백그라운드 세션 유지
     requestWakeLockAuto();
-
-    // 화면 꺼짐 백그라운드 재생 유지 (무음 루프 오디오 활성화)
-    if (isBgAudioMode) {
+    if (isBgAudioModeRef.current) {
       startBackgroundAudio();
     }
 
-    stopAllSpeech();
+    // 기존 오디오/타이머만 정리하고 백그라운드 <audio> 세션은 연속 유지
+    stopAllSpeech(isBgAudioModeRef.current);
+    const token = playbackTokenRef.current;
+
+    isPlayingRef.current = true;
+    isPausedRef.current = false;
+    isRestingRef.current = false;
+    currentSentenceIdxRef.current = sentenceIndex;
+    currentRepeatRef.current = repeatNum;
+    currentGenderRef.current = targetGender;
+
     setIsPlaying(true);
     setIsPaused(false);
     setIsResting(false);
@@ -525,121 +701,99 @@ export default function App() {
     setCurrentGender(targetGender);
     setIsRevealed(false);
 
-    const textToSpeak = sentences[sentenceIndex];
-    const effectiveRate = Number(playbackRateRef.current || playbackRate || 1.0);
+    const textToSpeak = activeList[sentenceIndex];
+    const effectiveRate = Math.max(0.5, Math.min(2.0, Number(playbackRateRef.current || 1.0)));
     const activeMode = voiceModeRef.current;
-    const activeRepeatCount = repeatCountRef.current;
-    const activePauseSeconds = pauseSecondsRef.current;
-    const activeFullLoop = isFullLoopRef.current;
 
     let effectiveGender: 'female' | 'male' = targetGender;
     if (activeMode === 'female-only') effectiveGender = 'female';
     else if (activeMode === 'male-only') effectiveGender = 'male';
 
     // -------------------------------------------------------------
-    // [엔진 A: MP3 오디오 스트리밍 모드]
-    // 스마트폰 전원 버튼을 눌러 화면을 완전히 끈 잠금 상태에서도 음악처럼 연속 재생 지원
+    // [엔진 A (기본): 표준 HTML <audio> 스트리밍 재생]
+    // 스마트폰 화면을 끄거나 다른 앱으로 전환해도 백그라운드에서 끊김 없이 연속 재생
     // -------------------------------------------------------------
-    if (audioEngine === 'mp3') {
-      if (!htmlAudioRef.current) {
-        htmlAudioRef.current = new Audio();
-      }
+    if (audioEngineRef.current === 'mp3') {
       const audio = htmlAudioRef.current;
-      audio.pause();
+      if (!audio) {
+        speakWithWebSpeech(sentenceIndex, repeatNum, targetGender, effectiveGender, textToSpeak, effectiveRate, token);
+        return;
+      }
 
-      const encoded = encodeURIComponent(textToSpeak.slice(0, 200));
-      audio.src = `https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q=${encoded}`;
-      audio.playbackRate = Math.max(0.5, Math.min(2.0, effectiveRate));
+      const chunks = splitTextForAudioTts(textToSpeak, 180);
+      if (chunks.length === 0) {
+        advanceAfterSentenceSpoken(sentenceIndex, repeatNum, targetGender, token);
+        return;
+      }
+
+      const selectedVoiceObj = voicesRef.current.find((v) => v.voiceURI === selectedVoiceURIRef.current);
+      const preferredLang =
+        activeMode === 'custom' && selectedVoiceObj
+          ? formatVoiceLang(selectedVoiceObj.lang)
+          : 'en-US';
 
       updateMediaSessionState(
         textToSpeak,
-        '🎵 MP3 화면꺼짐 지원 · RepeatEcho',
-        `문장 ${sentenceIndex + 1}/${sentences.length} · 반복 ${repeatNum}/${activeRepeatCount}회 · 전체 ${loopCycle}회차`,
+        `🎵 HTML 오디오 (${preferredLang}) · RepeatEcho`,
+        `문장 ${sentenceIndex + 1}/${activeList.length} · 반복 ${repeatNum}/${repeatCountRef.current}회 · 전체 ${loopCycleRef.current}회차`,
         {
-          onPlay: handleResume,
-          onPause: handlePause,
-          onPrevious: handlePrevSentence,
-          onNext: handleNextSentence
-        }
+          onPlay: () => mediaHandlersRef.current.onPlay(),
+          onPause: () => mediaHandlersRef.current.onPause(),
+          onStop: () => mediaHandlersRef.current.onStop(),
+          onPrevious: () => mediaHandlersRef.current.onPrevious(),
+          onNext: () => mediaHandlersRef.current.onNext(),
+        },
+        'playing'
       );
 
-      const handleAudioEnded = () => {
-        const currentMode = voiceModeRef.current;
-        const nextGender: 'female' | 'male' =
-          currentMode === 'alternate' ? (targetGender === 'female' ? 'male' : 'female') : targetGender;
+      const playChunk = (chunkIdx: number, tier: number) => {
+        if (playbackTokenRef.current !== token || !isPlayingRef.current || isPausedRef.current) return;
 
-        if (repeatNum < repeatCountRef.current) {
-          pauseTimerRef.current = window.setTimeout(() => {
-            speakSentence(sentenceIndex, repeatNum + 1, nextGender);
-          }, 300);
-        } else {
-          const nextIdx = sentenceIndex + 1;
-          if (nextIdx < sentences.length) {
-            const pSec = pauseSecondsRef.current;
-            if (pSec > 0) {
-              setIsResting(true);
-              setRestCountdown(pSec);
-              const startTime = Date.now();
-              const totalDuration = pSec * 1000;
+        audio.pause();
+        audio.src = buildAudioTtsUrl(chunks[chunkIdx], preferredLang, tier);
+        audio.preservesPitch = true;
+        audio.playbackRate = effectiveRate;
 
-              countdownIntervalRef.current = window.setInterval(() => {
-                const elapsed = Date.now() - startTime;
-                const remaining = Math.max(0, (totalDuration - elapsed) / 1000);
-                setRestCountdown(parseFloat(remaining.toFixed(1)));
-                if (remaining <= 0 && countdownIntervalRef.current) {
-                  clearInterval(countdownIntervalRef.current);
-                  countdownIntervalRef.current = null;
-                }
-              }, 100);
-
-              pauseTimerRef.current = window.setTimeout(() => {
-                setIsResting(false);
-                speakSentence(nextIdx, 1, nextGender);
-              }, totalDuration);
-            } else {
-              speakSentence(nextIdx, 1, nextGender);
-            }
+        audio.onended = () => {
+          if (playbackTokenRef.current !== token || !isPlayingRef.current || isPausedRef.current) return;
+          if (chunkIdx + 1 < chunks.length) {
+            playChunk(chunkIdx + 1, 0);
           } else {
-            if (activeFullLoop && sentences.length > 0) {
-              setLoopCycle((prev) => prev + 1);
-              setIsResting(true);
-              setRestCountdown(1.0);
-              pauseTimerRef.current = window.setTimeout(() => {
-                setIsResting(false);
-                speakSentence(0, 1, 'female');
-              }, 1000);
-            } else {
-              if (sessionSeconds >= 15) {
-                handleSaveCurrentSession();
-              }
-              setIsPlaying(false);
-              setIsPaused(false);
-              setIsResting(false);
-              stopBackgroundAudio();
-              releaseWakeLockAuto();
-            }
+            advanceAfterSentenceSpoken(sentenceIndex, repeatNum, targetGender, token);
           }
-        }
+        };
+
+        audio.onerror = () => {
+          if (playbackTokenRef.current !== token || !isPlayingRef.current || isPausedRef.current) return;
+          if (tier < 2) {
+            console.warn(`HTML <audio> TTS tier ${tier} failed, trying tier ${tier + 1}`);
+            playChunk(chunkIdx, tier + 1);
+          } else {
+            console.warn('All HTML <audio> TTS tiers failed, falling back to Web Speech API');
+            speakWithWebSpeech(sentenceIndex, repeatNum, targetGender, effectiveGender, textToSpeak, effectiveRate, token);
+          }
+        };
+
+        audio.play().catch((err) => {
+          if (playbackTokenRef.current !== token) return;
+          if (err && err.name === 'AbortError') return;
+          if (tier < 2) {
+            playChunk(chunkIdx, tier + 1);
+          } else {
+            console.warn('HTML <audio> play error, falling back to Web Speech:', err);
+            speakWithWebSpeech(sentenceIndex, repeatNum, targetGender, effectiveGender, textToSpeak, effectiveRate, token);
+          }
+        });
       };
 
-      audio.onended = handleAudioEnded;
-      audio.onerror = (e) => {
-        console.warn('MP3 stream error, falling back to Web Speech:', e);
-        speakWithWebSpeech(sentenceIndex, repeatNum, targetGender, effectiveGender, textToSpeak, effectiveRate);
-      };
-
-      audio.play().catch((err) => {
-        console.warn('Audio play error, falling back to Web Speech:', err);
-        speakWithWebSpeech(sentenceIndex, repeatNum, targetGender, effectiveGender, textToSpeak, effectiveRate);
-      });
+      playChunk(0, 0);
       return;
     }
 
     // -------------------------------------------------------------
-    // [엔진 B: 브라우저 내장 Web Speech API]
-    // 선택한 영어 음성(custom) 또는 남/녀 교차 및 피치 변조 지원
+    // [엔진 B: 기기 내장 브라우저 Web Speech API]
     // -------------------------------------------------------------
-    speakWithWebSpeech(sentenceIndex, repeatNum, targetGender, effectiveGender, textToSpeak, effectiveRate);
+    speakWithWebSpeech(sentenceIndex, repeatNum, targetGender, effectiveGender, textToSpeak, effectiveRate, token);
   };
 
   const speakWithWebSpeech = (
@@ -648,13 +802,15 @@ export default function App() {
     targetGender: 'female' | 'male',
     effectiveGender: 'female' | 'male',
     textToSpeak: string,
-    effectiveRate: number
+    effectiveRate: number,
+    expectedToken: number
   ) => {
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
-      alert('현재 브라우저에서 Web Speech API를 지원하지 않습니다.');
+      alert('현재 브라우저에서 음성 합성을 지원하지 않습니다.');
       return;
     }
 
+    const activeList = sentencesRef.current;
     const utterance = new SpeechSynthesisUtterance(textToSpeak);
     activeUtteranceRef.current = utterance;
 
@@ -700,17 +856,20 @@ export default function App() {
     updateMediaSessionState(
       textToSpeak,
       artistLabel,
-      `문장 ${sentenceIndex + 1}/${sentences.length} · 반복 ${repeatNum}/${repeatCountRef.current}회 · 전체 ${loopCycle}회차`,
+      `문장 ${sentenceIndex + 1}/${activeList.length} · 반복 ${repeatNum}/${repeatCountRef.current}회 · 전체 ${loopCycleRef.current}회차`,
       {
-        onPlay: handleResume,
-        onPause: handlePause,
-        onPrevious: handlePrevSentence,
-        onNext: handleNextSentence
-      }
+        onPlay: () => mediaHandlersRef.current.onPlay(),
+        onPause: () => mediaHandlersRef.current.onPause(),
+        onStop: () => mediaHandlersRef.current.onStop(),
+        onPrevious: () => mediaHandlersRef.current.onPrevious(),
+        onNext: () => mediaHandlersRef.current.onNext(),
+      },
+      'playing'
     );
 
     // 단어별 하이라이트
     utterance.onboundary = (event) => {
+      if (playbackTokenRef.current !== expectedToken) return;
       if (event.name === 'word') {
         setActiveWordCharRange({
           start: event.charIndex,
@@ -722,69 +881,7 @@ export default function App() {
     // 문장 읽기 종료 시 처리 (다음 재생에서 최신 선택 음성 즉시 반영)
     utterance.onend = () => {
       setActiveWordCharRange(null);
-
-      const latestMode = voiceModeRef.current;
-      const nextGender: 'female' | 'male' =
-        latestMode === 'alternate' ? (targetGender === 'female' ? 'male' : 'female') : targetGender;
-
-      if (repeatNum < repeatCountRef.current) {
-        pauseTimerRef.current = window.setTimeout(() => {
-          speakSentence(sentenceIndex, repeatNum + 1, nextGender);
-        }, 300);
-      } else {
-        const nextIdx = sentenceIndex + 1;
-
-        if (nextIdx < sentences.length) {
-          const pSec = pauseSecondsRef.current;
-          if (pSec > 0) {
-            setIsResting(true);
-            setRestCountdown(pSec);
-
-            const startTime = Date.now();
-            const totalDuration = pSec * 1000;
-
-            countdownIntervalRef.current = window.setInterval(() => {
-              const elapsed = Date.now() - startTime;
-              const remaining = Math.max(0, (totalDuration - elapsed) / 1000);
-              setRestCountdown(parseFloat(remaining.toFixed(1)));
-
-              if (remaining <= 0) {
-                if (countdownIntervalRef.current) {
-                  clearInterval(countdownIntervalRef.current);
-                  countdownIntervalRef.current = null;
-                }
-              }
-            }, 100);
-
-            pauseTimerRef.current = window.setTimeout(() => {
-              setIsResting(false);
-              speakSentence(nextIdx, 1, nextGender);
-            }, totalDuration);
-          } else {
-            speakSentence(nextIdx, 1, nextGender);
-          }
-        } else {
-          // 마지막 문장 종료 -> 전체 반복 여부 판별
-          if (isFullLoopRef.current && sentences.length > 0) {
-            setLoopCycle((prev) => prev + 1);
-            setIsResting(true);
-            setRestCountdown(1.0);
-            pauseTimerRef.current = window.setTimeout(() => {
-              setIsResting(false);
-              speakSentence(0, 1, nextGender);
-            }, 1000);
-          } else {
-            if (sessionSeconds >= 15) {
-              handleSaveCurrentSession();
-            }
-            setIsPlaying(false);
-            setIsPaused(false);
-            setIsResting(false);
-            stopBackgroundAudio();
-            releaseWakeLockAuto();
-          }
-        }
-      }
+      advanceAfterSentenceSpoken(sentenceIndex, repeatNum, targetGender, expectedToken);
     };
 
     utterance.onerror = (e) => {
@@ -849,15 +946,17 @@ export default function App() {
     setVoiceMode('custom');
     voiceModeRef.current = 'custom';
 
-    if (audioEngine === 'mp3') {
-      setAudioEngine('webspeech');
-    }
-
     const found = voicesRef.current.find((v) => v.voiceURI === value);
     if (found) {
-      setShowSaveSuccessToast(
-        `🎙 ${found.name} (${formatVoiceLang(found.lang)}) 선택됨 — 다음 재생부터 즉시 적용됩니다.`
-      );
+      if (audioEngineRef.current === 'mp3') {
+        setShowSaveSuccessToast(
+          `🎙 ${formatVoiceLang(found.lang)} 억양 적용됨 (화면꺼짐 HTML 오디오 모드 유지중 · 다음 재생부터 반영)`
+        );
+      } else {
+        setShowSaveSuccessToast(
+          `🎙 ${found.name} (${formatVoiceLang(found.lang)}) 선택됨 — 다음 재생부터 즉시 적용됩니다.`
+        );
+      }
       setTimeout(() => setShowSaveSuccessToast(null), 2800);
     }
   };
@@ -881,31 +980,43 @@ export default function App() {
     setPlaybackRate(clamped);
     playbackRateRef.current = clamped;
 
-    if (isPlaying && !isPaused && !isResting) {
-      stopAllSpeech();
-      speakSentence(currentSentenceIdx, currentRepeat, currentGender);
+    if (isPlayingRef.current && !isPausedRef.current && !isRestingRef.current) {
+      if (audioEngineRef.current === 'mp3' && htmlAudioRef.current && !htmlAudioRef.current.paused) {
+        htmlAudioRef.current.playbackRate = clamped;
+      } else {
+        stopAllSpeech(isBgAudioModeRef.current);
+        speakSentence(currentSentenceIdxRef.current, currentRepeatRef.current, currentGenderRef.current);
+      }
     }
   };
 
   // '학습 시작'
   const handleStart = () => {
-    if (sentences.length === 0) {
+    if (sentencesRef.current.length === 0) {
       alert('먼저 학습할 영어 문장을 입력하거나 추천 예문을 선택해 주세요.');
       return;
     }
+    loopCycleRef.current = 1;
+    sessionSecondsRef.current = 0;
     setLoopCycle(1);
     setSessionSeconds(0);
     requestWakeLockAuto();
+    if (isBgAudioModeRef.current) {
+      startBackgroundAudio();
+    }
     speakSentence(0, 1, 'female');
   };
 
   // '일시정지'
   const handlePause = () => {
-    if (!isPlaying || isPaused) return;
+    if (!isPlayingRef.current || isPausedRef.current) return;
+    playbackTokenRef.current += 1;
+    isPausedRef.current = true;
     setIsPaused(true);
     clearAllTimers();
     pauseBackgroundAudio();
-    if (audioEngine === 'mp3' && htmlAudioRef.current) {
+    setMediaSessionPlaybackState('paused');
+    if (audioEngineRef.current === 'mp3' && htmlAudioRef.current) {
       htmlAudioRef.current.pause();
     }
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
@@ -915,23 +1026,36 @@ export default function App() {
 
   // '재개'
   const handleResume = () => {
-    if (!isPlaying || !isPaused) return;
-    setIsPaused(false);
-    requestWakeLockAuto();
-    if (isBgAudioMode) {
-      startBackgroundAudio();
-    }
-    if (audioEngine === 'mp3' && htmlAudioRef.current) {
-      htmlAudioRef.current.play().catch(() => {
-        speakSentence(currentSentenceIdx, currentRepeat, currentGender);
-      });
+    if (!isPlayingRef.current) {
+      handleStart();
       return;
     }
+    if (!isPausedRef.current) return;
+    isPausedRef.current = false;
+    setIsPaused(false);
+    requestWakeLockAuto();
+    if (isBgAudioModeRef.current) {
+      startBackgroundAudio();
+    }
+    setMediaSessionPlaybackState('playing');
+
+    if (audioEngineRef.current === 'mp3' && htmlAudioRef.current) {
+      const audio = htmlAudioRef.current;
+      if (!isRestingRef.current && audio.src && audio.paused && !audio.ended && audio.currentTime > 0) {
+        audio.play().catch(() => {
+          speakSentence(currentSentenceIdxRef.current, currentRepeatRef.current, currentGenderRef.current);
+        });
+      } else {
+        speakSentence(currentSentenceIdxRef.current, currentRepeatRef.current, currentGenderRef.current);
+      }
+      return;
+    }
+
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       window.speechSynthesis.resume();
       setTimeout(() => {
-        if (!window.speechSynthesis.speaking && isPlaying) {
-          speakSentence(currentSentenceIdx, currentRepeat, currentGender);
+        if (!window.speechSynthesis.speaking && isPlayingRef.current && !isPausedRef.current) {
+          speakSentence(currentSentenceIdxRef.current, currentRepeatRef.current, currentGenderRef.current);
         }
       }, 150);
     }
@@ -939,12 +1063,20 @@ export default function App() {
 
   // '정지 (처음부터)'
   const handleStop = () => {
-    // 15초 이상 학습했으면 정지 시 자동 저장
-    if (sessionSeconds >= 15 && sentences.length > 0) {
+    if (sessionSecondsRef.current >= 15 && sentencesRef.current.length > 0) {
       handleSaveCurrentSession();
     }
     releaseWakeLockAuto();
-    stopAllSpeech();
+    stopAllSpeech(false);
+    isPlayingRef.current = false;
+    isPausedRef.current = false;
+    isRestingRef.current = false;
+    currentSentenceIdxRef.current = 0;
+    currentRepeatRef.current = 1;
+    currentGenderRef.current = 'female';
+    loopCycleRef.current = 1;
+    sessionSecondsRef.current = 0;
+
     setIsPlaying(false);
     setIsPaused(false);
     setCurrentSentenceIdx(0);
@@ -954,35 +1086,49 @@ export default function App() {
     setSessionSeconds(0);
     setIsResting(false);
     setIsRevealed(false);
+    setMediaSessionPlaybackState('none');
   };
 
   // 이전 문장
   const handlePrevSentence = () => {
-    if (currentSentenceIdx > 0) {
-      speakSentence(currentSentenceIdx - 1, 1, 'female');
+    if (currentSentenceIdxRef.current > 0) {
+      if (isBgAudioModeRef.current) startBackgroundAudio();
+      speakSentence(currentSentenceIdxRef.current - 1, 1, 'female');
     }
   };
 
   // 다음 문장
   const handleNextSentence = () => {
-    if (currentSentenceIdx < sentences.length - 1) {
-      speakSentence(currentSentenceIdx + 1, 1, 'female');
+    if (currentSentenceIdxRef.current < sentencesRef.current.length - 1) {
+      if (isBgAudioModeRef.current) startBackgroundAudio();
+      speakSentence(currentSentenceIdxRef.current + 1, 1, 'female');
     }
   };
 
   // 현재 문장 다시 듣기
   const handleReplayCurrent = () => {
-    if (sentences.length > 0) {
-      speakSentence(currentSentenceIdx, 1, currentGender);
+    if (sentencesRef.current.length > 0) {
+      if (isBgAudioModeRef.current) startBackgroundAudio();
+      speakSentence(currentSentenceIdxRef.current, 1, currentGenderRef.current);
     }
   };
 
   // 특정 문장 클릭하여 점프
   const handleJumpTo = (index: number) => {
+    if (isBgAudioModeRef.current) startBackgroundAudio();
     speakSentence(index, 1, 'female');
     if (mobileTab === 'list') {
       setMobileTab('theater');
     }
+  };
+
+  // Keep MediaSession delegator refs always fresh (prevents stale closure on lock screen)
+  mediaHandlersRef.current = {
+    onPlay: handleResume,
+    onPause: handlePause,
+    onStop: handleStop,
+    onPrevious: handlePrevSentence,
+    onNext: handleNextSentence,
   };
 
   // 음성 모드 토글
@@ -1005,9 +1151,10 @@ export default function App() {
   const toggleBgAudioMode = () => {
     setIsBgAudioMode((prev) => {
       const next = !prev;
+      isBgAudioModeRef.current = next;
       if (!next) {
         stopBackgroundAudio();
-      } else if (isPlaying && !isPaused) {
+      } else if (isPlayingRef.current && !isPausedRef.current) {
         startBackgroundAudio();
       }
       return next;
@@ -1148,6 +1295,24 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col text-slate-900 pb-28 sm:pb-12">
+      {/* 표준 HTML <audio> 태그 (Web Audio API 미사용 · 화면 꺼짐 및 백그라운드 앱 전환 시 연속 재생) */}
+      <audio
+        ref={htmlAudioRef}
+        playsInline
+        preload="auto"
+        aria-hidden="true"
+        className="hidden"
+      />
+      <audio
+        ref={bgKeepAliveAudioRef}
+        src={SILENT_WAV_BASE64}
+        loop
+        playsInline
+        preload="auto"
+        aria-hidden="true"
+        className="hidden"
+      />
+
       {/* Toast 알림 */}
       {showSaveSuccessToast && (
         <div className="fixed top-18 left-1/2 -translate-x-1/2 z-50 bg-slate-900/95 text-white px-4 py-2.5 rounded-2xl shadow-xl border border-slate-700 text-xs sm:text-sm font-semibold flex items-center gap-2 animate-bounce-short">
@@ -1514,7 +1679,7 @@ export default function App() {
                   스마트폰 화면 끄기 & 주머니 재생 제어
                 </span>
                 <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                  {audioEngine === 'mp3' ? '🎵 MP3 화면 잠금 지원' : '🗣 브라우저 TTS + 주머니 모드'}
+                  {audioEngine === 'mp3' ? '🎵 HTML <audio> 화면꺼짐·앱전환 지원중' : '🎙 기기 음성 (Web Speech)'}
                 </span>
                 {wakeLockActive && (
                   <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-sky-500/20 text-sky-300 border border-sky-500/30">
@@ -1525,11 +1690,12 @@ export default function App() {
               <p className="text-[11px] sm:text-xs text-slate-300 mt-1 leading-relaxed">
                 {audioEngine === 'mp3' ? (
                   <>
-                    <strong className="text-emerald-400">MP3 오디오 모드:</strong> 스마트폰 전원 버튼을 눌러 화면을 완전히 꺼도 음악처럼 이어폰으로 끊김 없이 재생됩니다.
+                    <strong className="text-emerald-400">표준 HTML &lt;audio&gt; 재생 모드:</strong> 스마트폰 화면을 끄거나 다른 앱(카톡·유튜브 등)으로 전환해도 끊기지 않으며, 잠금 화면 위젯에서 재생/일시정지를 제어할 수 있습니다.
                   </>
                 ) : (
                   <>
-                    <strong className="text-amber-300">중요:</strong> 전원 버튼 대신 <strong className="text-indigo-300">[🌙 주머니 절전 모드]</strong>를 누르면 완전 암전(OLED 배터리 0% 소모) 및 터치 잠금 상태로 안전하게 주머니에서 들으실 수 있습니다.
+                    <strong className="text-amber-300">기기 내장 음성(TTS) 모드:</strong> 선택한 기기 음성과 남/녀 피치 보정으로 재생됩니다. 화면을 끄거나 다른 앱 전환 시 끊길 경우{' '}
+                    <strong className="text-emerald-300">[HTML 오디오(화면꺼짐 지원)]</strong>으로 전환해 주세요.
                   </>
                 )}
               </p>
@@ -1557,18 +1723,19 @@ export default function App() {
               onClick={() => {
                 const next = audioEngine === 'webspeech' ? 'mp3' : 'webspeech';
                 setAudioEngine(next);
-                if (isPlaying) {
-                  stopAllSpeech();
+                audioEngineRef.current = next;
+                if (isPlayingRef.current) {
+                  stopAllSpeech(isBgAudioModeRef.current);
                   setTimeout(() => {
-                    speakSentence(currentSentenceIdx, currentRepeat, currentGender);
-                  }, 120);
+                    speakSentence(currentSentenceIdxRef.current, currentRepeatRef.current, currentGenderRef.current);
+                  }, 80);
                 }
               }}
               className="flex-1 sm:flex-initial px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer shadow-xs active:scale-95 min-h-[40px]"
-              title="MP3 잠금화면 모드와 브라우저 TTS 모드를 전환합니다"
+              title="표준 HTML <audio> 백그라운드 모드와 기기 내장 음성 모드를 전환합니다"
             >
               <Radio className="w-3.5 h-3.5" />
-              <span>{audioEngine === 'webspeech' ? '전원 끄기 지원(MP3)으로 변경' : '남/녀 교차 TTS로 변경'}</span>
+              <span>{audioEngine === 'mp3' ? '기기 내장 음성(남녀교차)으로 전환' : '화면꺼짐 HTML 오디오로 전환'}</span>
             </button>
 
             {/* 가이드 모달 열기 */}
